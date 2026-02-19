@@ -38,6 +38,10 @@
 
 #include "config.h"
 
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
 // ---------------------------------------------------------------------------
 // Display – SH1106 128×64, full-buffer, hardware I²C
 // ---------------------------------------------------------------------------
@@ -65,8 +69,17 @@ static bool   g_updateAvailable = false;
 static String g_statusMsg      = "Connecting...";
 static unsigned long g_lastPoll = 0;
 static unsigned long g_lastUpdateCheck = 0;
+static unsigned long g_lastControllerStatsPoll = 0;
+static float  g_lastPollWorkPct = -1.0f;
 static float  g_inGraphScale   = 0.1f;
 static float  g_outGraphScale  = 0.1f;
+static float  g_espCpuUtilPct  = -1.0f;
+static float  g_espTempC       = -1.0f;
+static float  g_ucgCpuUtilPct  = -1.0f;
+static float  g_ucgMemUtilPct  = -1.0f;
+static float  g_ucgTempC       = -1.0f;
+static unsigned long g_lastEspStatsUpdateMs = 0;
+static unsigned long g_lastUcgStatsUpdateMs = 0;
 
 enum LedMode {
   LED_MODE_WORKING,
@@ -91,6 +104,16 @@ static const int kBootButtonPin = 0;
 static const bool kBootButtonActiveLow = true;
 static const unsigned long kBootButtonDebounceMs = 30UL;
 static const unsigned long kBootButtonIpShowMs = 5000UL;
+static const unsigned long kControllerStatsPollMs = 10000UL;
+static const int kStatusLedPin = LED_BUILTIN;
+static const bool kStatusLedActiveLow = false;
+static const unsigned long kLedWorkingBlinkMs = 250UL;
+static const unsigned long kLedWanDownBlinkMs = 70UL;
+static const unsigned long kLedOkHeartbeatMs = 30000UL;
+static const unsigned long kLedOkPulseMs = 120UL;
+static constexpr float kGraphScaleDecayFactor = 0.90f;
+static constexpr float kGraphMinScaleMbps = 0.0001f;
+static constexpr float kRateBpsThresholdMbps = 0.001f;
 
 // ---------------------------------------------------------------------------
 // Waveform history  (one sample per horizontal pixel = 128 columns)
@@ -119,11 +142,16 @@ bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
 bool  parseLatencyValue(JsonVariantConst value, float& latencyMs);
 bool  extractWanLatencyMs(JsonObjectConst wanObj, float& latencyMs);
 bool  isWanSubsysDown(JsonObjectConst wanObj);
+bool  parseNumericValue(JsonVariantConst value, float& parsed);
+bool  keyContainsAny(const String& key, const char* const* tokens, size_t tokenCount);
+void  scanSystemMetrics(JsonVariantConst node, bool& gotCpu, bool& gotMem, bool& gotTemp, float& cpuPct, float& memPct, float& tempC);
+bool  fetchControllerResourceStats(float& cpuPct, float& memPct, float& tempC);
+float cToF(float c);
 void  initWebServer();
 void  handleWebRoot();
 void  handleWebStats();
 void  appendHistory(JsonArray arr, float* history, int points);
-float historyPeak(float* history);
+float historyPeakRecent(float* history, int samplesBack);
 void  drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int bottomY, float scalePeakMbps);
 void  ledSet(bool on);
 void  ledSetMode(LedMode mode);
@@ -144,7 +172,7 @@ void setup() {
   initBootButton();
 
   if (STATUS_LED_ENABLED) {
-    pinMode(STATUS_LED_PIN, OUTPUT);
+    pinMode(kStatusLedPin, OUTPUT);
   }
   ledSetMode(LED_MODE_WORKING);
 
@@ -192,6 +220,7 @@ void loop() {
 
   // Poll on interval
   if (millis() - g_lastPoll >= POLL_INTERVAL_MS) {
+    unsigned long pollStart = millis();
     g_lastPoll = millis();
 
     if (!fetchTrafficStats()) {
@@ -223,6 +252,39 @@ void loop() {
       }
       g_lastUpdateCheck = millis();
     }
+
+    if (g_lastControllerStatsPoll == 0 || (millis() - g_lastControllerStatsPoll >= kControllerStatsPollMs)) {
+      float cpuPct = -1.0f;
+      float memPct = -1.0f;
+      float tempC = -1.0f;
+      if (fetchControllerResourceStats(cpuPct, memPct, tempC)) {
+        bool updatedAny = false;
+        if (cpuPct >= 0.0f && cpuPct <= 100.0f) {
+          g_ucgCpuUtilPct = cpuPct;
+          updatedAny = true;
+        }
+        if (memPct >= 0.0f && memPct <= 100.0f) {
+          g_ucgMemUtilPct = memPct;
+          updatedAny = true;
+        }
+        if (tempC >= 0.0f && tempC <= 150.0f) {
+          g_ucgTempC = tempC;
+          updatedAny = true;
+        }
+        if (updatedAny) {
+          g_lastUcgStatsUpdateMs = millis();
+        }
+      }
+      g_lastControllerStatsPoll = millis();
+    }
+
+    g_espTempC = temperatureRead();
+    unsigned long pollElapsed = millis() - pollStart;
+    float workPct = (100.0f * (float)pollElapsed) / (float)POLL_INTERVAL_MS;
+    if (workPct > 100.0f) workPct = 100.0f;
+    g_lastPollWorkPct = workPct;
+    g_espCpuUtilPct = g_lastPollWorkPct;
+    g_lastEspStatsUpdateMs = millis();
 
     drawDisplay();
   }
@@ -266,11 +328,11 @@ void ledSet(bool on) {
   g_ledOn = on;
   int level;
   if (on) {
-    level = STATUS_LED_ACTIVE_LOW ? LOW : HIGH;
+    level = kStatusLedActiveLow ? LOW : HIGH;
   } else {
-    level = STATUS_LED_ACTIVE_LOW ? HIGH : LOW;
+    level = kStatusLedActiveLow ? HIGH : LOW;
   }
-  digitalWrite(STATUS_LED_PIN, level);
+  digitalWrite(kStatusLedPin, level);
 }
 
 void ledSetMode(LedMode mode) {
@@ -308,7 +370,7 @@ void ledUpdate() {
   }
 
   if (g_ledMode == LED_MODE_WORKING) {
-    if (now - g_ledLastToggle >= LED_WORKING_BLINK_MS) {
+    if (now - g_ledLastToggle >= kLedWorkingBlinkMs) {
       ledSet(!g_ledOn);
       g_ledLastToggle = now;
     }
@@ -316,23 +378,23 @@ void ledUpdate() {
   }
 
   if (g_ledMode == LED_MODE_WAN_DOWN) {
-    if (now - g_ledLastToggle >= LED_WAN_DOWN_BLINK_MS) {
+    if (now - g_ledLastToggle >= kLedWanDownBlinkMs) {
       ledSet(!g_ledOn);
       g_ledLastToggle = now;
     }
     return;
   }
 
-  // LED_MODE_OK: pulse every LED_OK_HEARTBEAT_MS
+  // LED_MODE_OK: pulse every kLedOkHeartbeatMs
   if (g_ledPulseActive) {
-    if (now - g_ledLastPulseStart >= LED_OK_PULSE_MS) {
+    if (now - g_ledLastPulseStart >= kLedOkPulseMs) {
       ledSet(false);
       g_ledPulseActive = false;
     }
     return;
   }
 
-  if (now - g_ledLastPulseStart >= LED_OK_HEARTBEAT_MS) {
+  if (now - g_ledLastPulseStart >= kLedOkHeartbeatMs) {
     ledSet(true);
     g_ledPulseActive = true;
     g_ledLastPulseStart = now;
@@ -446,6 +508,9 @@ void handleWebRoot() {
     <div class="card"><div class="k">WAN Uptime (24h)</div><div id="uptime" class="v">--</div></div>
     <div class="card"><div class="k">WAN Latency</div><div id="latency" class="v">--</div></div>
     <div class="card"><div class="k">Controller Update</div><div id="update" class="v">--</div></div>
+    <div class="card"><div class="k">UCG CPU</div><div id="ucgCpu" class="v">--</div></div>
+    <div class="card"><div class="k">UCG Memory</div><div id="ucgMem" class="v">--</div></div>
+    <div class="card"><div class="k">UCG Temp (°F)</div><div id="ucgTemp" class="v">--</div></div>
   </div>
 
   <div class="grid" style="margin-top:12px;">
@@ -462,6 +527,10 @@ void handleWebRoot() {
     <div class="row"><span>Fetch Errors</span><span id="fetchErr">--</span></div>
     <div class="row"><span>Free Heap</span><span id="heap">--</span></div>
     <div class="row"><span>Uptime</span><span id="up">--</span></div>
+    <div class="row"><span>ESP CPU</span><span id="espCpu">--</span></div>
+    <div class="row"><span>ESP Internal Temp</span><span id="espTemp">--</span></div>
+    <div class="row"><span>ESP Stats Age</span><span id="espAge">--</span></div>
+    <div class="row"><span>UCG Stats Age</span><span id="ucgAge">--</span></div>
   </div>
 
   <script>
@@ -485,8 +554,27 @@ void handleWebRoot() {
 
     function fmtMbps(v) {
       if (v == null || isNaN(v)) return '--';
-      if (v < 1) return (v*1000).toFixed(0) + ' Kbps';
+      if (v < 0.001) return Math.round(v * 1000000) + ' bps';
+      if (v < 1) return (v * 1000).toFixed(0) + ' Kbps';
       return v.toFixed(2) + ' Mbps';
+    }
+
+    function fmtPct(v) {
+      if (v == null || isNaN(v) || v < 0) return '--';
+      return v.toFixed(1) + '%';
+    }
+
+    function fmtTemp(v) {
+      if (v == null || isNaN(v) || v < -40) return '--';
+      return v.toFixed(1) + ' °F';
+    }
+
+    function fmtAge(v) {
+      if (v == null || isNaN(v) || v < 0) return '--';
+      if (v < 60) return Math.round(v) + 's ago';
+      const m = Math.floor(v / 60);
+      const s = Math.round(v % 60);
+      return m + 'm ' + s + 's ago';
     }
 
     async function tick() {
@@ -506,6 +594,13 @@ void handleWebRoot() {
         document.getElementById('fetchErr').textContent = d.fetch_errors;
         document.getElementById('heap').textContent = d.heap_free + ' bytes';
         document.getElementById('up').textContent = d.uptime_s + ' s';
+        document.getElementById('espAge').textContent = fmtAge(d.esp_stats_age_s);
+        document.getElementById('ucgAge').textContent = fmtAge(d.ucg_stats_age_s);
+        document.getElementById('espCpu').textContent = fmtPct(d.esp_cpu_util_pct);
+        document.getElementById('espTemp').textContent = fmtTemp(d.esp_temp_f);
+        document.getElementById('ucgCpu').textContent = fmtPct(d.ucg_cpu_util_pct);
+        document.getElementById('ucgMem').textContent = fmtPct(d.ucg_mem_util_pct);
+        document.getElementById('ucgTemp').textContent = fmtTemp(d.ucg_temp_f);
         drawLine('inChart', d.in_history || [], '#22c55e');
         drawLine('outChart', d.out_history || [], '#38bdf8');
       } catch (e) {
@@ -551,6 +646,16 @@ void handleWebStats() {
   doc["ip"] = WiFi.localIP().toString();
   doc["heap_free"] = ESP.getFreeHeap();
   doc["uptime_s"] = millis() / 1000UL;
+  doc["esp_cpu_util_pct"] = g_espCpuUtilPct;
+  doc["esp_temp_f"] = (g_espTempC < 0.0f) ? -1.0f : cToF(g_espTempC);
+  doc["ucg_cpu_util_pct"] = g_ucgCpuUtilPct;
+  doc["ucg_mem_util_pct"] = g_ucgMemUtilPct;
+  doc["ucg_temp_f"] = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
+
+  long espAgeMs = (g_lastEspStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastEspStatsUpdateMs);
+  long ucgAgeMs = (g_lastUcgStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastUcgStatsUpdateMs);
+  doc["esp_stats_age_s"] = (espAgeMs < 0) ? -1.0f : (float)espAgeMs / 1000.0f;
+  doc["ucg_stats_age_s"] = (ucgAgeMs < 0) ? -1.0f : (float)ucgAgeMs / 1000.0f;
 
   JsonArray inHist = doc.createNestedArray("in_history");
   JsonArray outHist = doc.createNestedArray("out_history");
@@ -1058,6 +1163,199 @@ bool isWanSubsysDown(JsonObjectConst wanObj) {
   return false;
 }
 
+bool parseNumericValue(JsonVariantConst value, float& parsed) {
+  if (value.is<float>() || value.is<double>() || value.is<int>() || value.is<long>()) {
+    parsed = (float)value.as<double>();
+    return true;
+  }
+
+  if (value.is<const char*>()) {
+    String s = value.as<const char*>();
+    s.trim();
+    s.replace("%", "");
+    s.replace("C", "");
+    s.replace("c", "");
+    s.replace("°", "");
+    if (s.length() == 0) return false;
+
+    char* endPtr = nullptr;
+    double v = strtod(s.c_str(), &endPtr);
+    if (endPtr == s.c_str()) return false;
+    parsed = (float)v;
+    return true;
+  }
+
+  return false;
+}
+
+bool keyContainsAny(const String& key, const char* const* tokens, size_t tokenCount) {
+  String lower = key;
+  lower.toLowerCase();
+  for (size_t i = 0; i < tokenCount; i++) {
+    if (lower.indexOf(tokens[i]) >= 0) return true;
+  }
+  return false;
+}
+
+void scanSystemMetrics(JsonVariantConst node, bool& gotCpu, bool& gotMem, bool& gotTemp, float& cpuPct, float& memPct, float& tempC) {
+  if (node.is<JsonObjectConst>()) {
+    JsonObjectConst obj = node.as<JsonObjectConst>();
+
+    if (!gotMem) {
+      float used = -1.0f;
+      float total = -1.0f;
+      float freeVal = -1.0f;
+      float avail = -1.0f;
+
+      if (parseNumericValue(obj["used"], used) && parseNumericValue(obj["total"], total) && total > 0.0f) {
+        float pct = (used * 100.0f) / total;
+        if (pct >= 0.0f && pct <= 100.0f) {
+          memPct = pct;
+          gotMem = true;
+        }
+      }
+
+      if (!gotMem && parseNumericValue(obj["free"], freeVal) && parseNumericValue(obj["total"], total) && total > 0.0f) {
+        float pct = ((total - freeVal) * 100.0f) / total;
+        if (pct >= 0.0f && pct <= 100.0f) {
+          memPct = pct;
+          gotMem = true;
+        }
+      }
+
+      if (!gotMem && parseNumericValue(obj["available"], avail) && parseNumericValue(obj["total"], total) && total > 0.0f) {
+        float pct = ((total - avail) * 100.0f) / total;
+        if (pct >= 0.0f && pct <= 100.0f) {
+          memPct = pct;
+          gotMem = true;
+        }
+      }
+    }
+
+    static const char* cpuTokens[] = {"cpu", "load"};
+    static const char* memTokens[] = {"mem", "memory", "ram"};
+    static const char* tempTokens[] = {"temp", "thermal"};
+    static const char* memBadTokens[] = {"total", "free", "avail", "available", "cached", "buffer"};
+
+    for (JsonPairConst kv : obj) {
+      String key = kv.key().c_str();
+      String keyLower = key;
+      keyLower.toLowerCase();
+      JsonVariantConst value = kv.value();
+
+      float parsed = -1.0f;
+      bool scalar = parseNumericValue(value, parsed);
+
+      if (scalar) {
+        if (!gotCpu && keyContainsAny(keyLower, cpuTokens, sizeof(cpuTokens) / sizeof(cpuTokens[0])) && keyLower.indexOf("temp") < 0) {
+          float pct = parsed;
+          if (pct >= 0.0f && pct <= 1.0f) pct *= 100.0f;
+          if (pct >= 0.0f && pct <= 100.0f) {
+            cpuPct = pct;
+            gotCpu = true;
+          }
+        }
+
+        if (!gotMem && keyContainsAny(keyLower, memTokens, sizeof(memTokens) / sizeof(memTokens[0]))
+            && !keyContainsAny(keyLower, memBadTokens, sizeof(memBadTokens) / sizeof(memBadTokens[0]))) {
+          float pct = parsed;
+          if (pct >= 0.0f && pct <= 1.0f) pct *= 100.0f;
+          if (pct >= 0.0f && pct <= 100.0f) {
+            memPct = pct;
+            gotMem = true;
+          }
+        }
+
+        if (!gotTemp && keyContainsAny(keyLower, tempTokens, sizeof(tempTokens) / sizeof(tempTokens[0]))) {
+          float c = parsed;
+          bool keySaysF = (keyLower.indexOf("_f") >= 0 || keyLower.indexOf("fahren") >= 0);
+          bool keySaysC = (keyLower.indexOf("_c") >= 0 || keyLower.indexOf("celsius") >= 0);
+
+          if (keySaysF) {
+            c = (c - 32.0f) * (5.0f / 9.0f);
+          }
+          if (c > 1000.0f && c < 200000.0f) {
+            c = c / 1000.0f;
+          }
+          // Some payloads provide Fahrenheit without explicit unit hints.
+          // Values above realistic router Celsius range are treated as Fahrenheit.
+          if (!keySaysC && !keySaysF && c > 90.0f && c <= 150.0f) {
+            c = (c - 32.0f) * (5.0f / 9.0f);
+          }
+          if (c > 150.0f && c <= 212.0f) {
+            c = (c - 32.0f) * (5.0f / 9.0f);
+          }
+          if (c >= 0.0f && c <= 150.0f) {
+            tempC = c;
+            gotTemp = true;
+          }
+        }
+      }
+
+      if (!gotCpu || !gotMem || !gotTemp) {
+        scanSystemMetrics(value, gotCpu, gotMem, gotTemp, cpuPct, memPct, tempC);
+      }
+    }
+    return;
+  }
+
+  if (node.is<JsonArrayConst>()) {
+    JsonArrayConst arr = node.as<JsonArrayConst>();
+    for (JsonVariantConst item : arr) {
+      if (gotCpu && gotMem && gotTemp) break;
+      scanSystemMetrics(item, gotCpu, gotMem, gotTemp, cpuPct, memPct, tempC);
+    }
+  }
+}
+
+bool fetchControllerResourceStats(float& cpuPct, float& memPct, float& tempC) {
+  cpuPct = -1.0f;
+  memPct = -1.0f;
+  tempC = -1.0f;
+
+  String base = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT;
+  String endpoint1 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo";
+  String endpoint2 = base + "/api/system";
+  String endpoint3 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/device";
+  const String endpoints[3] = {endpoint1, endpoint2, endpoint3};
+
+  bool anySuccess = false;
+
+  for (int i = 0; i < 3; i++) {
+    // Stop early only when all three metrics have been found
+    if (cpuPct >= 0.0f && memPct >= 0.0f && tempC >= 0.0f) break;
+
+    String payload;
+    int httpCode = 0;
+    bool ok = fetchJsonPayload(endpoints[i], payload, httpCode);
+    if (!ok) continue;
+
+    DynamicJsonDocument doc(24576);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) continue;
+
+    bool gotCpu  = (cpuPct  >= 0.0f);  // already satisfied – don't overwrite
+    bool gotMem  = (memPct  >= 0.0f);
+    bool gotTemp = (tempC   >= 0.0f);
+    float foundCpu  = cpuPct;
+    float foundMem  = memPct;
+    float foundTemp = tempC;
+    scanSystemMetrics(doc.as<JsonVariantConst>(), gotCpu, gotMem, gotTemp, foundCpu, foundMem, foundTemp);
+
+    if (gotCpu  && cpuPct  < 0.0f) cpuPct  = foundCpu;
+    if (gotMem  && memPct  < 0.0f) memPct  = foundMem;
+    if (gotTemp && tempC   < 0.0f) tempC   = foundTemp;
+
+    if (gotCpu || gotMem || gotTemp) anySuccess = true;
+  }
+
+  return anySuccess;
+}
+
+float cToF(float c) {
+  return (c * 9.0f / 5.0f) + 32.0f;
+}
+
 // ===========================================================================
 // Display
 // ===========================================================================
@@ -1066,31 +1364,31 @@ bool isWanSubsysDown(JsonObjectConst wanObj) {
  * Format a Mbps value into a compact human-readable string.
  */
 static void formatRate(float mbps, char* buf, size_t bufLen) {
-  if (mbps < 1.0f) {
+  if (mbps < kRateBpsThresholdMbps) {
+    snprintf(buf, bufLen, "%.0f bps", mbps * 1000000.0f);
+  } else if (mbps < 1.0f) {
     snprintf(buf, bufLen, "%.0f Kbps", mbps * 1000.0f);
   } else {
     snprintf(buf, bufLen, "%.2f Mbps", mbps);
   }
 }
 
-static void formatCompactRate(float mbps, char* buf, size_t bufLen) {
-  if (mbps < 1.0f) {
-    snprintf(buf, bufLen, "%.0fK", mbps * 1000.0f);
-  } else if (mbps < 10.0f) {
-    snprintf(buf, bufLen, "%.1fM", mbps);
-  } else {
-    snprintf(buf, bufLen, "%.0fM", mbps);
-  }
-}
-
 /*
  * Draw real traffic history as a line graph confined to one box.
  */
-float historyPeak(float* history) {
-  float peak = 0.1f;
-  for (int i = 0; i < GRAPH_SAMPLES; i++) {
-    if (history[i] > peak) peak = history[i];
+float historyPeakRecent(float* history, int samplesBack) {
+  if (samplesBack < 1) samplesBack = 1;
+  if (samplesBack > GRAPH_SAMPLES) samplesBack = GRAPH_SAMPLES;
+
+  float peak = 0.0001f;
+  int startIdx = g_histIdx - samplesBack;
+  while (startIdx < 0) startIdx += GRAPH_SAMPLES;
+
+  for (int i = 0; i < samplesBack; i++) {
+    int idx = (startIdx + i) % GRAPH_SAMPLES;
+    if (history[idx] > peak) peak = history[idx];
   }
+
   return peak;
 }
 
@@ -1151,24 +1449,25 @@ void drawDisplay() {
   u8g2.drawHLine(1, 11, splitX - 1);
   u8g2.drawHLine(1, 37, splitX - 1);
 
-  // Real traffic graphs per IN/OUT box, each with independent scale
-  float inPeakRaw  = historyPeak(g_inHistory);
-  float outPeakRaw = historyPeak(g_outHistory);
+  // Real traffic graphs per IN/OUT box, each with independent scale.
+  // Use a recent window so old spikes don't keep low traffic flattened.
+  float inPeakRaw  = historyPeakRecent(g_inHistory, GRAPH_SCALE_WINDOW_SAMPLES);
+  float outPeakRaw = historyPeakRecent(g_outHistory, GRAPH_SCALE_WINDOW_SAMPLES);
 
   if (inPeakRaw > g_inGraphScale) {
     g_inGraphScale = inPeakRaw;
   } else {
-    g_inGraphScale *= 0.97f;
+    g_inGraphScale *= kGraphScaleDecayFactor;
     if (g_inGraphScale < inPeakRaw) g_inGraphScale = inPeakRaw;
-    if (g_inGraphScale < 0.1f) g_inGraphScale = 0.1f;
+    if (g_inGraphScale < kGraphMinScaleMbps) g_inGraphScale = kGraphMinScaleMbps;
   }
 
   if (outPeakRaw > g_outGraphScale) {
     g_outGraphScale = outPeakRaw;
   } else {
-    g_outGraphScale *= 0.97f;
+    g_outGraphScale *= kGraphScaleDecayFactor;
     if (g_outGraphScale < outPeakRaw) g_outGraphScale = outPeakRaw;
-    if (g_outGraphScale < 0.1f) g_outGraphScale = 0.1f;
+    if (g_outGraphScale < kGraphMinScaleMbps) g_outGraphScale = kGraphMinScaleMbps;
   }
 
   drawTrafficGraphInBox(g_inHistory,  leftInnerL, leftInnerR, 12, 36, g_inGraphScale);
@@ -1257,8 +1556,8 @@ void drawDisplay() {
 
     const char* popupTitle = "LOCAL IP";
     u8g2.setFont(u8g2_font_4x6_tf);
-    int titleW = u8g2.getStrWidth(popupTitle);
-    u8g2.drawStr(boxX + (boxW - titleW) / 2, boxY + 8, popupTitle);
+    int popupTitleW = u8g2.getStrWidth(popupTitle);
+    u8g2.drawStr(boxX + (boxW - popupTitleW) / 2, boxY + 8, popupTitle);
 
     u8g2.setFont(u8g2_font_5x8_tf);
     int ipW = u8g2.getStrWidth(g_bootIpOverlayMsg.c_str());

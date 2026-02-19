@@ -25,9 +25,10 @@ The vertical divider spans the full panel height, with the client value slightly
 `WAN LATENCY` appears below uptime and shows current WAN latency in milliseconds.
 The graph lines in **IN** and **OUT** are based on actual sampled traffic history.
 IN and OUT graphs scale independently.
+Graph autoscaling prioritizes recent samples so old spikes don't flatten low-traffic detail.
 When an update is detected, `UPDATE` appears in the bottom-right corner.
 
-Values automatically switch between **Kbps** and **Mbps** depending on the magnitude.
+Values automatically switch between **bps**, **Kbps**, and **Mbps** depending on the magnitude.
 
 ## Web dashboard
 
@@ -42,6 +43,9 @@ Dashboard includes:
 - WAN uptime (24h)
 - WAN latency
 - Update availability
+- ESP32 CPU utilization estimate and **internal** temperature (°F, approximate)
+- UCG-MAX CPU utilization, memory utilization, and temperature (°F, when exposed by UniFi API)
+- Last-update ages for ESP32 stats and UCG-MAX stats
 - Health details (RSSI, IP, fetch errors, status, free heap, uptime)
 
 ---
@@ -121,14 +125,12 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 // Check for UniFi OS / Network updates every 30 minutes
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
 
+// Graph scaling / rate formatting (applies to both IN and OUT)
+// With POLL_INTERVAL_MS = 1000, this is effectively a seconds window.
+#define GRAPH_SCALE_WINDOW_SAMPLES  24
+
 // Status LED (uses LED_BUILTIN by default)
 #define STATUS_LED_ENABLED       1
-#define STATUS_LED_PIN           LED_BUILTIN
-#define STATUS_LED_ACTIVE_LOW    0
-#define LED_WORKING_BLINK_MS     250UL
-#define LED_WAN_DOWN_BLINK_MS    70UL
-#define LED_OK_HEARTBEAT_MS      30000UL
-#define LED_OK_PULSE_MS          120UL
 
 // BOOT button actions (GPIO0 by default)
 #define BOOT_BUTTON_ENABLED       1
@@ -177,6 +179,12 @@ Set `STATUS_LED_ENABLED` to `0` in `config.h` to disable all LED behavior.
 - Short press: show local IP in a bordered popup on OLED for ~5 seconds
 
 Set `BOOT_BUTTON_ENABLED` to `0` in `config.h` if you do not want any BOOT button actions.
+
+### Security notes
+
+- HTTPS is currently configured with `setInsecure()` (certificate validation disabled) to support self-signed controller certs.
+- Keep this monitor on a trusted LAN/VLAN. Do not expose it directly to the internet.
+- The API key is stored in plaintext in `config.h`; treat firmware source and flashed devices as sensitive.
 
 ---
 
