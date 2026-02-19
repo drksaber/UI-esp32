@@ -1,6 +1,6 @@
 # UniFi Traffic Monitor – ESP32 + SH1106 OLED
 
-Displays **real-time internet traffic** (IN ↓ / OUT ↑ Mbps) from a **Ubiquiti UCG-MAX** on a 128×64 SH1106 OLED connected to an ESP32 over I²C.
+Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG-MAX** on a 128×64 SH1106 OLED connected to an ESP32 over I²C.
 
 ---
 
@@ -8,6 +8,7 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑ Mbps) from a **Ubiquit
 
 ```
 ┌────────────────────────────────┐
+│ Clients :12                    │
 │      INTERNET TRAFFIC          │
 ├────────────────────────────────┤
 │ ▼ IN                           │
@@ -17,6 +18,8 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑ Mbps) from a **Ubiquit
 │          3.56 Mbps             │
 └────────────────────────────────┘
 ```
+
+The panel includes a subtle animated **sine-wave background** behind the text and frame lines.
 
 Values automatically switch between **Kbps** and **Mbps** depending on the magnitude.
 
@@ -75,9 +78,11 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 // UCG-MAX LAN IP or hostname
 #define UNIFI_HOST      "192.168.1.1"
 
-// Local admin credentials
-#define UNIFI_USER      "admin"
-#define UNIFI_PASS      "your_password"
+// HTTPS port
+#define UNIFI_PORT      443
+
+// UniFi OS API key
+#define UNIFI_API_KEY   "your_api_key"
 
 // Site (usually "default")
 #define UNIFI_SITE      "default"
@@ -86,11 +91,14 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 #define OLED_SDA_PIN    21
 #define OLED_SCL_PIN    22
 
-// Poll interval
-#define POLL_INTERVAL_MS  2000
+// Poll interval (1000 ms recommended)
+#define POLL_INTERVAL_MS  1000
+
+// Rebuild TLS after this many consecutive fetch failures
+#define MAX_FETCH_ERRORS  3
 ```
 
-> **Tip:** Create a dedicated read-only local admin account in the UniFi console for this device instead of using your main account.
+> **Tip:** Create a dedicated API key for this device in UniFi OS → Settings → API Keys.
 
 ---
 
@@ -107,6 +115,8 @@ Headers: `X-API-KEY: …` and `Accept: application/json`
 → Returns per-subsystem health. The `"wan"` entry contains:
 - `rx_bytes-r` — bytes/sec received (download / IN)
 - `tx_bytes-r` — bytes/sec transmitted (upload / OUT)
+
+The top line `Clients :#` is derived from health subsystem counts (`wlan`/`lan` user totals when available).
 
 Conversion: `Mbps = bytes_per_sec × 8 ÷ 1 000 000`
 
