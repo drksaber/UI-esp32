@@ -20,6 +20,14 @@
 // Site name – almost always "default" unless you renamed it
 #define UNIFI_SITE      "default"
 
+// Optional TLS certificate fingerprint (SHA-1, colon-separated) for the UCG-MAX.
+// If set, the ESP32 will reject connections whose certificate doesn't match –
+// protecting against MITM even on a local network.
+// Retrieve with:
+//   echo | openssl s_client -connect <ip>:443 2>/dev/null | openssl x509 -noout -fingerprint -sha1
+// Leave blank ("") to accept any certificate (default – LAN-trust assumption).
+#define UNIFI_TLS_FINGERPRINT   ""
+
 // =============================================================
 //  Display – SH1106 128×64 I²C
 // =============================================================
@@ -58,6 +66,14 @@
 // =============================================================
 // Set to 0 to disable all status LED behavior
 #define STATUS_LED_ENABLED       1
+
+// =============================================================
+//  Web Dashboard Authentication
+// =============================================================
+// Set both to non-empty strings to require HTTP Digest Auth on / and /api/stats.
+// Leave blank to allow unauthenticated access (default – LAN-trust assumption).
+#define WEB_AUTH_USER   ""
+#define WEB_AUTH_PASS   ""
 
 // =============================================================
 //  BOOT Button (GPIO0 on most ESP32 dev boards)

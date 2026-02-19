@@ -299,7 +299,13 @@ void loop() {
  * Safe to call multiple times – just resets internal state.
  */
 void initHttpClient() {
-  g_secureClient.setInsecure();   // accept self-signed UCG-MAX cert
+  if (strlen(UNIFI_TLS_FINGERPRINT) > 0) {
+    g_secureClient.setFingerprint(UNIFI_TLS_FINGERPRINT);  // verify UCG-MAX cert
+    Serial.println("[HTTP] TLS fingerprint verification enabled");
+  } else {
+    g_secureClient.setInsecure();   // LAN-trust: accept any cert (see UNIFI_TLS_FINGERPRINT)
+    Serial.println("[HTTP] TLS verification disabled – set UNIFI_TLS_FINGERPRINT to enable");
+  }
   g_http.setReuse(true);          // keep TCP/TLS connection alive between requests
   g_httpInitialised = true;
   Serial.println("[HTTP] persistent client ready");
@@ -478,7 +484,24 @@ void updateBootButton() {
   }
 }
 
+static bool webCheckAuth() {
+  if (strlen(WEB_AUTH_USER) > 0 && strlen(WEB_AUTH_PASS) > 0) {
+    if (!g_web.authenticate(WEB_AUTH_USER, WEB_AUTH_PASS)) {
+      g_web.requestAuthentication(DIGEST_AUTH, "UniFi Monitor");
+      return false;
+    }
+  }
+  return true;
+}
+
+static void webSendSecurityHeaders() {
+  g_web.sendHeader("X-Frame-Options", "SAMEORIGIN");
+  g_web.sendHeader("X-Content-Type-Options", "nosniff");
+  g_web.sendHeader("Cache-Control", "no-store");
+}
+
 void handleWebRoot() {
+  if (!webCheckAuth()) return;
   static const char page[] PROGMEM = R"HTML(
 <!doctype html>
 <html>
@@ -615,6 +638,7 @@ void handleWebRoot() {
 </html>
   )HTML";
 
+  webSendSecurityHeaders();
   g_web.send(200, "text/html", page);
 }
 
@@ -632,6 +656,7 @@ void appendHistory(JsonArray arr, float* history, int points) {
 }
 
 void handleWebStats() {
+  if (!webCheckAuth()) return;
   DynamicJsonDocument doc(16384);
   doc["in_mbps"] = g_inMbps;
   doc["out_mbps"] = g_outMbps;
@@ -664,6 +689,7 @@ void handleWebStats() {
 
   String payload;
   serializeJson(doc, payload);
+  webSendSecurityHeaders();
   g_web.send(200, "application/json", payload);
 }
 

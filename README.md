@@ -132,6 +132,13 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 // Status LED (uses LED_BUILTIN by default)
 #define STATUS_LED_ENABLED       1
 
+// Optional TLS fingerprint – leave blank to accept any cert
+#define UNIFI_TLS_FINGERPRINT   ""
+
+// Optional web dashboard auth – leave blank for open access
+#define WEB_AUTH_USER   ""
+#define WEB_AUTH_PASS   ""
+
 // BOOT button actions (GPIO0 by default)
 #define BOOT_BUTTON_ENABLED       1
 ```
