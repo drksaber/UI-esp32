@@ -45,3 +45,31 @@
 // How often to check if UniFi OS / Network updates are available
 // 30 minutes = 1,800,000 ms
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
+
+// =============================================================
+//  Status LED
+// =============================================================
+// Set to 0 to disable all status LED behavior
+#define STATUS_LED_ENABLED       1
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
+// GPIO used for the status LED
+#define STATUS_LED_PIN           LED_BUILTIN
+
+// Set to 1 if your LED is active-low (ON = GPIO LOW)
+#define STATUS_LED_ACTIVE_LOW    0
+
+// While loading / connecting, LED blinks quickly
+#define LED_WORKING_BLINK_MS     250UL
+
+// If WAN is reported down, blink super fast
+#define LED_WAN_DOWN_BLINK_MS    70UL
+
+// Healthy state heartbeat blink interval
+#define LED_OK_HEARTBEAT_MS      30000UL
+
+// Width of the heartbeat pulse
+#define LED_OK_PULSE_MS          120UL

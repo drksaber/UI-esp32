@@ -57,10 +57,27 @@ static float  g_inMbps         = 0.0f;
 static float  g_outMbps        = 0.0f;
 static int    g_clients        = -1;
 static float  g_wanUptimePct   = -1.0f;
+static float  g_wanLatencyMs   = -1.0f;
+static bool   g_wanDown        = false;
 static bool   g_updateAvailable = false;
 static String g_statusMsg      = "Connecting...";
 static unsigned long g_lastPoll = 0;
 static unsigned long g_lastUpdateCheck = 0;
+static float  g_inGraphScale   = 0.1f;
+static float  g_outGraphScale  = 0.1f;
+
+enum LedMode {
+  LED_MODE_WORKING,
+  LED_MODE_WAN_DOWN,
+  LED_MODE_OK,
+  LED_MODE_ERROR
+};
+
+static LedMode g_ledMode = LED_MODE_WORKING;
+static bool g_ledOn = false;
+static bool g_ledPulseActive = false;
+static unsigned long g_ledLastToggle = 0;
+static unsigned long g_ledLastPulseStart = 0;
 
 // ---------------------------------------------------------------------------
 // Waveform history  (one sample per horizontal pixel = 128 columns)
@@ -85,8 +102,14 @@ bool  valueLooksAvailable(JsonVariantConst value);
 bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false);
 bool  parsePercentValue(JsonVariantConst value, float& pct);
 bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
+bool  parseLatencyValue(JsonVariantConst value, float& latencyMs);
+bool  extractWanLatencyMs(JsonObjectConst wanObj, float& latencyMs);
+bool  isWanSubsysDown(JsonObjectConst wanObj);
 float historyPeak(float* history);
 void  drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int bottomY, float scalePeakMbps);
+void  ledSet(bool on);
+void  ledSetMode(LedMode mode);
+void  ledUpdate();
 void  drawDisplay();
 void  drawError(const String& line1, const String& line2 = "");
 
@@ -97,6 +120,11 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n[UniFi Traffic Monitor] starting...");
+
+  if (STATUS_LED_ENABLED) {
+    pinMode(STATUS_LED_PIN, OUTPUT);
+  }
+  ledSetMode(LED_MODE_WORKING);
 
   // --- Display init --------------------------------------------------------
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
@@ -121,13 +149,19 @@ void setup() {
 // loop()
 // ===========================================================================
 void loop() {
+  ledUpdate();
+
   // Reconnect WiFi if lost
   if (WiFi.status() != WL_CONNECTED) {
+    ledSetMode(LED_MODE_WORKING);
     closeConnection();
     g_statusMsg = "WiFi lost...";
     drawDisplay();
-    wifiConnect();
-    initHttpClient();
+    if (wifiConnect()) {
+      initHttpClient();
+    } else {
+      ledSetMode(LED_MODE_ERROR);
+    }
     return;
   }
 
@@ -136,6 +170,7 @@ void loop() {
     g_lastPoll = millis();
 
     if (!fetchTrafficStats()) {
+      ledSetMode(LED_MODE_ERROR);
       g_fetchErrors++;
       if (g_fetchErrors >= MAX_FETCH_ERRORS) {
         // Persistent failure – tear down TLS and rebuild on next poll
@@ -145,6 +180,11 @@ void loop() {
       }
     } else {
       g_fetchErrors = 0;
+      if (g_wanDown) {
+        ledSetMode(LED_MODE_WAN_DOWN);
+      } else {
+        ledSetMode(LED_MODE_OK);
+      }
     }
 
     if (g_lastUpdateCheck == 0 || (millis() - g_lastUpdateCheck >= UPDATE_CHECK_INTERVAL_MS)) {
@@ -192,18 +232,104 @@ void closeConnection() {
 // ===========================================================================
 // WiFi helpers
 // ===========================================================================
+void ledSet(bool on) {
+  if (!STATUS_LED_ENABLED) {
+    g_ledOn = false;
+    return;
+  }
+
+  g_ledOn = on;
+  int level;
+  if (on) {
+    level = STATUS_LED_ACTIVE_LOW ? LOW : HIGH;
+  } else {
+    level = STATUS_LED_ACTIVE_LOW ? HIGH : LOW;
+  }
+  digitalWrite(STATUS_LED_PIN, level);
+}
+
+void ledSetMode(LedMode mode) {
+  if (!STATUS_LED_ENABLED) {
+    g_ledMode = mode;
+    g_ledOn = false;
+    g_ledPulseActive = false;
+    return;
+  }
+
+  if (g_ledMode == mode) return;
+
+  g_ledMode = mode;
+  g_ledLastToggle = millis();
+  g_ledLastPulseStart = millis();
+  g_ledPulseActive = false;
+
+  if (mode == LED_MODE_ERROR) {
+    ledSet(true);
+  } else if (mode == LED_MODE_WORKING) {
+    ledSet(true);
+  } else {
+    ledSet(false);
+  }
+}
+
+void ledUpdate() {
+  if (!STATUS_LED_ENABLED) return;
+
+  unsigned long now = millis();
+
+  if (g_ledMode == LED_MODE_ERROR) {
+    if (!g_ledOn) ledSet(true);
+    return;
+  }
+
+  if (g_ledMode == LED_MODE_WORKING) {
+    if (now - g_ledLastToggle >= LED_WORKING_BLINK_MS) {
+      ledSet(!g_ledOn);
+      g_ledLastToggle = now;
+    }
+    return;
+  }
+
+  if (g_ledMode == LED_MODE_WAN_DOWN) {
+    if (now - g_ledLastToggle >= LED_WAN_DOWN_BLINK_MS) {
+      ledSet(!g_ledOn);
+      g_ledLastToggle = now;
+    }
+    return;
+  }
+
+  // LED_MODE_OK: pulse every LED_OK_HEARTBEAT_MS
+  if (g_ledPulseActive) {
+    if (now - g_ledLastPulseStart >= LED_OK_PULSE_MS) {
+      ledSet(false);
+      g_ledPulseActive = false;
+    }
+    return;
+  }
+
+  if (now - g_ledLastPulseStart >= LED_OK_HEARTBEAT_MS) {
+    ledSet(true);
+    g_ledPulseActive = true;
+    g_ledLastPulseStart = now;
+  }
+}
+
 bool wifiConnect() {
+  ledSetMode(LED_MODE_WORKING);
+
   Serial.printf("[WiFi] connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
+    ledUpdate();
     if (millis() - t0 > 20000) {
       Serial.println("[WiFi] timeout");
+      ledSetMode(LED_MODE_ERROR);
       return false;
     }
-    delay(500);
+    delay(100);
     Serial.print('.');
   }
 
@@ -286,12 +412,29 @@ bool fetchTrafficStats() {
   }
 
   bool foundWan = false;
+  bool wanDown = false;
   int wlanClients = -1;
   int lanClients  = -1;
   int fallbackClients = -1;
+  float discoveredWanUptime = -1.0f;
+  float discoveredWanLatency = -1.0f;
 
   for (JsonObject subsys : dataArr) {
     const char* name = subsys["subsystem"];
+
+    if (discoveredWanUptime < 0.0f) {
+      float pct = -1.0f;
+      if (extractWanUptime24h(subsys, pct)) {
+        discoveredWanUptime = pct;
+      }
+    }
+
+    if (discoveredWanLatency < 0.0f) {
+      float ms = -1.0f;
+      if (extractWanLatencyMs(subsys, ms)) {
+        discoveredWanLatency = ms;
+      }
+    }
 
     int users = -1;
     if (!subsys["num_user"].isNull()) {
@@ -310,6 +453,8 @@ bool fetchTrafficStats() {
     }
 
     if (name && strcmp(name, "wan") == 0) {
+      wanDown = isWanSubsysDown(subsys);
+
       // bytes per second → Mbps  (×8 / 1 000 000)
       float rxRate = subsys["rx_bytes-r"] | 0.0f;
       float txRate = subsys["tx_bytes-r"] | 0.0f;
@@ -324,17 +469,14 @@ bool fetchTrafficStats() {
 
       Serial.printf("[Stats] IN=%.2f Mbps  OUT=%.2f Mbps\n", g_inMbps, g_outMbps);
 
-      float wanUptime = -1.0f;
-      if (extractWanUptime24h(subsys.as<JsonObjectConst>(), wanUptime)) {
-        g_wanUptimePct = wanUptime;
-      } else {
-        g_wanUptimePct = -1.0f;
-      }
-
       g_statusMsg = "OK";
       foundWan = true;
     }
   }
+
+  g_wanUptimePct = discoveredWanUptime;
+  g_wanLatencyMs = discoveredWanLatency;
+  g_wanDown = wanDown;
 
   if (wlanClients >= 0 || lanClients >= 0) {
     int total = 0;
@@ -492,6 +634,30 @@ bool fetchUpdateAvailability(bool& updateAvailable) {
 bool parsePercentValue(JsonVariantConst value, float& pct) {
   if (value.isNull()) return false;
 
+  if (value.is<JsonObjectConst>()) {
+    JsonObjectConst obj = value.as<JsonObjectConst>();
+
+    const char* percentKeys[] = {"pct", "percent", "percentage", "value"};
+    for (size_t i = 0; i < sizeof(percentKeys) / sizeof(percentKeys[0]); i++) {
+      JsonVariantConst v = obj[percentKeys[i]];
+      if (parsePercentValue(v, pct)) return true;
+    }
+
+    for (JsonPairConst kv : obj) {
+      if (parsePercentValue(kv.value(), pct)) return true;
+    }
+
+    return false;
+  }
+
+  if (value.is<JsonArrayConst>()) {
+    JsonArrayConst arr = value.as<JsonArrayConst>();
+    for (JsonVariantConst item : arr) {
+      if (parsePercentValue(item, pct)) return true;
+    }
+    return false;
+  }
+
   if (value.is<float>() || value.is<double>() || value.is<int>() || value.is<long>()) {
     double v = value.as<double>();
     if (v >= 0.0 && v <= 1.0) v *= 100.0;  // ratio → percent
@@ -559,6 +725,114 @@ bool extractWanUptime24h(JsonObjectConst wanObj, float& pct) {
   return false;
 }
 
+bool parseLatencyValue(JsonVariantConst value, float& latencyMs) {
+  if (value.isNull()) return false;
+
+  if (value.is<float>() || value.is<double>() || value.is<int>() || value.is<long>()) {
+    double v = value.as<double>();
+    if (v < 0.0 || v > 10000.0) return false;
+    latencyMs = (float)v;
+    return true;
+  }
+
+  if (value.is<const char*>()) {
+    String s = value.as<const char*>();
+    s.trim();
+    s.toLowerCase();
+    s.replace("ms", "");
+    if (s.length() == 0) return false;
+
+    char* endPtr = nullptr;
+    double v = strtod(s.c_str(), &endPtr);
+    if (endPtr == s.c_str()) return false;
+    if (v < 0.0 || v > 10000.0) return false;
+    latencyMs = (float)v;
+    return true;
+  }
+
+  if (value.is<JsonObjectConst>()) {
+    JsonObjectConst obj = value.as<JsonObjectConst>();
+    const char* keys[] = {"ms", "latency", "value", "avg", "average", "mean", "rtt"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+      JsonVariantConst v = obj[keys[i]];
+      if (parseLatencyValue(v, latencyMs)) return true;
+    }
+
+    for (JsonPairConst kv : obj) {
+      String key = kv.key().c_str();
+      key.toLowerCase();
+      if (key.indexOf("latency") >= 0 || key.indexOf("ping") >= 0 || key.indexOf("rtt") >= 0) {
+        if (parseLatencyValue(kv.value(), latencyMs)) return true;
+      }
+    }
+  }
+
+  if (value.is<JsonArrayConst>()) {
+    JsonArrayConst arr = value.as<JsonArrayConst>();
+    for (JsonVariantConst item : arr) {
+      if (parseLatencyValue(item, latencyMs)) return true;
+    }
+  }
+
+  return false;
+}
+
+bool extractWanLatencyMs(JsonObjectConst wanObj, float& latencyMs) {
+  const char* directKeys[] = {
+    "latency",
+    "wan_latency",
+    "latency_ms",
+    "avg_latency",
+    "average_latency",
+    "wan_latency_ms",
+    "ping",
+    "ping_ms",
+    "rtt",
+    "rtt_ms"
+  };
+
+  for (size_t i = 0; i < sizeof(directKeys) / sizeof(directKeys[0]); i++) {
+    JsonVariantConst v = wanObj[directKeys[i]];
+    if (parseLatencyValue(v, latencyMs)) return true;
+  }
+
+  for (JsonPairConst kv : wanObj) {
+    String key = kv.key().c_str();
+    key.toLowerCase();
+    if (key.indexOf("latency") >= 0 || key.indexOf("ping") >= 0 || key.indexOf("rtt") >= 0) {
+      if (parseLatencyValue(kv.value(), latencyMs)) return true;
+    }
+  }
+
+  return false;
+}
+
+bool isWanSubsysDown(JsonObjectConst wanObj) {
+  // Boolean flags commonly used by UniFi payloads
+  const char* boolDownKeys[] = {"up", "connected", "is_up", "link_up", "wan_up"};
+  for (size_t i = 0; i < sizeof(boolDownKeys) / sizeof(boolDownKeys[0]); i++) {
+    JsonVariantConst v = wanObj[boolDownKeys[i]];
+    if (v.is<bool>()) {
+      return !v.as<bool>();
+    }
+  }
+
+  // Text state keys
+  const char* stateKeys[] = {"status", "state", "wan_status", "link_state"};
+  for (size_t i = 0; i < sizeof(stateKeys) / sizeof(stateKeys[0]); i++) {
+    JsonVariantConst v = wanObj[stateKeys[i]];
+    if (v.is<const char*>()) {
+      String s = v.as<const char*>();
+      s.toLowerCase();
+      s.trim();
+      if (s == "down" || s == "disconnected" || s == "offline" || s == "inactive") return true;
+      if (s == "up" || s == "connected" || s == "online" || s == "active" || s == "ok") return false;
+    }
+  }
+
+  return false;
+}
+
 // ===========================================================================
 // Display
 // ===========================================================================
@@ -604,17 +878,20 @@ void drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int 
   if (peak < 0.1f) peak = 0.1f;
 
   int graphPixels = w - 2;
-  int sampleCount = GRAPH_SAMPLES;
+  int windowSamples = graphPixels;
+  if (windowSamples > GRAPH_SAMPLES) windowSamples = GRAPH_SAMPLES;
+  if (windowSamples < 2) return;
+
+  int oldestIdx = g_histIdx - windowSamples;
+  while (oldestIdx < 0) oldestIdx += GRAPH_SAMPLES;
+
   int prevX = 0;
   int prevY = 0;
   bool hasPrev = false;
 
-  for (int i = 0; i < graphPixels; i++) {
-    int x = leftX + 1 + i;
-
-    // oldest sample at g_histIdx, newest at (g_histIdx-1)
-    int sampleOffset = (i * sampleCount) / graphPixels;
-    int sampleIdx = (g_histIdx + sampleOffset) % sampleCount;
+  for (int i = 0; i < windowSamples; i++) {
+    int x = leftX + 1 + ((i * (graphPixels - 1)) / (windowSamples - 1));
+    int sampleIdx = (oldestIdx + i) % GRAPH_SAMPLES;
     float v = history[sampleIdx];
 
     int y = bottomY - 1 - (int)((v / peak) * (h - 2));
@@ -632,7 +909,8 @@ void drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int 
 }
 
 void drawDisplay() {
-  char bufIn[16], bufOut[16], clientBuf[20], uptimeBuf[12], peakBuf[10], maxBuf[16];
+  char bufIn[16], bufOut[16], clientBuf[20], uptimeBuf[12], latencyBuf[12];
+  char inLine[24], outLine[24];
   formatRate(g_inMbps,  bufIn,  sizeof(bufIn));
   formatRate(g_outMbps, bufOut, sizeof(bufOut));
 
@@ -648,35 +926,42 @@ void drawDisplay() {
   u8g2.drawHLine(1, 11, splitX - 1);
   u8g2.drawHLine(1, 37, splitX - 1);
 
-  // Real traffic graphs per IN/OUT box, using a shared vertical scale
-  float sharedPeak = historyPeak(g_inHistory);
-  float outPeak = historyPeak(g_outHistory);
-  if (outPeak > sharedPeak) sharedPeak = outPeak;
-  formatCompactRate(sharedPeak, peakBuf, sizeof(peakBuf));
+  // Real traffic graphs per IN/OUT box, each with independent scale
+  float inPeakRaw  = historyPeak(g_inHistory);
+  float outPeakRaw = historyPeak(g_outHistory);
 
-  drawTrafficGraphInBox(g_inHistory,  leftInnerL, leftInnerR, 12, 36, sharedPeak);
-  drawTrafficGraphInBox(g_outHistory, leftInnerL, leftInnerR, 38, 62, sharedPeak);
+  if (inPeakRaw > g_inGraphScale) {
+    g_inGraphScale = inPeakRaw;
+  } else {
+    g_inGraphScale *= 0.97f;
+    if (g_inGraphScale < inPeakRaw) g_inGraphScale = inPeakRaw;
+    if (g_inGraphScale < 0.1f) g_inGraphScale = 0.1f;
+  }
+
+  if (outPeakRaw > g_outGraphScale) {
+    g_outGraphScale = outPeakRaw;
+  } else {
+    g_outGraphScale *= 0.97f;
+    if (g_outGraphScale < outPeakRaw) g_outGraphScale = outPeakRaw;
+    if (g_outGraphScale < 0.1f) g_outGraphScale = 0.1f;
+  }
+
+  drawTrafficGraphInBox(g_inHistory,  leftInnerL, leftInnerR, 12, 36, g_inGraphScale);
+  drawTrafficGraphInBox(g_outHistory, leftInnerL, leftInnerR, 38, 62, g_outGraphScale);
 
   // Left column title + traffic values
   u8g2.setFont(u8g2_font_4x6_tf);
   const char* title = "INTERNET TRAFFIC";
   int titleW = u8g2.getStrWidth(title);
-  u8g2.drawStr((splitX - titleW) / 2, 6, title);
+  u8g2.drawStr((splitX - titleW) / 2, 7, title);
 
   u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(4, 20, "\x19 IN");
-  int inW = u8g2.getStrWidth(bufIn);
-  u8g2.drawStr((splitX - inW) / 2, 33, bufIn);
-
-  u8g2.drawStr(4, 46, "\x1a OUT");
-  u8g2.setFont(u8g2_font_4x6_tf);
-  snprintf(maxBuf, sizeof(maxBuf), "M %s", peakBuf);
-  int maxW = u8g2.getStrWidth(maxBuf);
-  u8g2.drawStr(splitX - maxW - 2, 40, maxBuf);
+  snprintf(inLine, sizeof(inLine), "IN: %s", bufIn);
+  u8g2.drawStr(4, 20, inLine);
 
   u8g2.setFont(u8g2_font_5x8_tf);
-  int outW = u8g2.getStrWidth(bufOut);
-  u8g2.drawStr((splitX - outW) / 2, 59, bufOut);
+  snprintf(outLine, sizeof(outLine), "OUT: %s", bufOut);
+  u8g2.drawStr(4, 46, outLine);
 
   // Right column clients panel
   u8g2.setFont(u8g2_font_4x6_tf);
@@ -697,7 +982,7 @@ void drawDisplay() {
   u8g2.setFont(u8g2_font_4x6_tf);
   const char* uptimeTitle = "WAN UPTIME";
   int uptimeTitleW = u8g2.getStrWidth(uptimeTitle);
-  u8g2.drawStr(rightCenterX - (uptimeTitleW / 2), 34, uptimeTitle);
+  u8g2.drawStr(rightCenterX - (uptimeTitleW / 2), 30, uptimeTitle);
 
   if (g_wanUptimePct >= 0.0f) {
     snprintf(uptimeBuf, sizeof(uptimeBuf), "%.1f%%", g_wanUptimePct);
@@ -705,7 +990,19 @@ void drawDisplay() {
     snprintf(uptimeBuf, sizeof(uptimeBuf), "--.-%%");
   }
   int uptimeW = u8g2.getStrWidth(uptimeBuf);
-  u8g2.drawStr(rightCenterX - (uptimeW / 2), 43, uptimeBuf);
+  u8g2.drawStr(rightCenterX - (uptimeW / 2), 37, uptimeBuf);
+
+  const char* latencyTitle = "WAN LATENCY";
+  int latencyTitleW = u8g2.getStrWidth(latencyTitle);
+  u8g2.drawStr(rightCenterX - (latencyTitleW / 2), 45, latencyTitle);
+
+  if (g_wanLatencyMs >= 0.0f) {
+    snprintf(latencyBuf, sizeof(latencyBuf), "%.1fms", g_wanLatencyMs);
+  } else {
+    snprintf(latencyBuf, sizeof(latencyBuf), "--.-ms");
+  }
+  int latencyW = u8g2.getStrWidth(latencyBuf);
+  u8g2.drawStr(rightCenterX - (latencyW / 2), 52, latencyBuf);
 
   if (g_updateAvailable) {
     u8g2.setFont(u8g2_font_4x6_tf);

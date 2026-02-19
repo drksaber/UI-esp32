@@ -10,12 +10,11 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG
 ┌────────────────────────────────┐
 │ INTERNET TRAFFIC    │ Clients: │
 ├─────────────────────┤          │
-│ ▼ IN                │    12    │
-│   /\/\ 12.45 Mbps   │          │
-├─────────────── M 24M┤          │
-│ ▲ OUT               │          │
-│   /\/\ 3.56 Mbps    │WAN UPTIME│
-│                     │  99.9%   │
+│ IN: 12.45 Mbps      │    12    │
+│   /\/\              │WAN UPTIME│
+├─────────────────────┤  99.9%   │
+│ OUT: 3.56 Mbps      │WAN LATENCY│
+│   /\/\              │  14.2ms  │
 │                     │    UPDATE│
 └────────────────────────────────┘
 ```
@@ -23,9 +22,9 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG
 The panel uses a split layout: **left 2/3** for internet traffic and **right 1/3** for clients.
 The vertical divider spans the full panel height, with the client value slightly below `Clients:`.
 `WAN UPTIME` appears below the client count and shows 24h WAN uptime percentage.
+`WAN LATENCY` appears below uptime and shows current WAN latency in milliseconds.
 The graph lines in **IN** and **OUT** are based on actual sampled traffic history.
-Both graphs use a shared vertical scale so IN vs OUT height is directly comparable.
-A compact shared scale label is shown once on the right side of the middle IN/OUT divider.
+IN and OUT graphs scale independently.
 When an update is detected, `UPDATE` appears in the bottom-right corner.
 
 Values automatically switch between **Kbps** and **Mbps** depending on the magnitude.
@@ -106,6 +105,13 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 
 // Check for UniFi OS / Network updates every 30 minutes
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
+
+// Status LED (uses LED_BUILTIN by default)
+#define STATUS_LED_PIN           LED_BUILTIN
+#define STATUS_LED_ACTIVE_LOW    0
+#define LED_WORKING_BLINK_MS     250UL
+#define LED_OK_HEARTBEAT_MS      30000UL
+#define LED_OK_PULSE_MS          120UL
 ```
 
 > **Tip:** Create a dedicated API key for this device in UniFi OS → Settings → API Keys.
@@ -128,6 +134,7 @@ Headers: `X-API-KEY: …` and `Accept: application/json`
 
 The `Clients:` panel value is derived from health subsystem counts (`wlan`/`lan` user totals when available).
 `WAN UPTIME` is parsed from WAN health uptime/availability fields when exposed by the UniFi API.
+`WAN LATENCY` is parsed from WAN latency/ping/rtt fields when exposed by the UniFi API.
 
 Conversion: `Mbps = bytes_per_sec × 8 ÷ 1 000 000`
 
@@ -135,6 +142,12 @@ Conversion: `Mbps = bytes_per_sec × 8 ÷ 1 000 000`
 
 Every `UPDATE_CHECK_INTERVAL_MS` (default 30 minutes), the sketch checks UniFi update status endpoints.
 If an update flag is detected, the display shows `UPDATE` in the bottom-right corner.
+
+### Status LED behavior
+
+- Loading / connecting to WiFi: fast blink
+- Healthy (`fetchTrafficStats()` successful): heartbeat blink every 30 seconds
+- API/connectivity error: solid ON
 
 ---
 
