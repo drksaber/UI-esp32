@@ -11,16 +11,22 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG
 │ INTERNET TRAFFIC    │ Clients: │
 ├─────────────────────┤          │
 │ ▼ IN                │    12    │
-│   ~~~ 12.45 Mbps ~~ │          │
-├─────────────────────┤          │
+│   /\/\ 12.45 Mbps   │          │
+├─────────────── M 24M┤          │
 │ ▲ OUT               │          │
-│   ~~~ 3.56 Mbps  ~~ │          │
+│   /\/\ 3.56 Mbps    │WAN UPTIME│
+│                     │  99.9%   │
+│                     │    UPDATE│
 └────────────────────────────────┘
 ```
 
 The panel uses a split layout: **left 2/3** for internet traffic and **right 1/3** for clients.
 The vertical divider spans the full panel height, with the client value slightly below `Clients:`.
-Animated sine waves are drawn only inside the **IN** and **OUT** boxes.
+`WAN UPTIME` appears below the client count and shows 24h WAN uptime percentage.
+The graph lines in **IN** and **OUT** are based on actual sampled traffic history.
+Both graphs use a shared vertical scale so IN vs OUT height is directly comparable.
+A compact shared scale label is shown once on the right side of the middle IN/OUT divider.
+When an update is detected, `UPDATE` appears in the bottom-right corner.
 
 Values automatically switch between **Kbps** and **Mbps** depending on the magnitude.
 
@@ -97,6 +103,9 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 
 // Rebuild TLS after this many consecutive fetch failures
 #define MAX_FETCH_ERRORS  3
+
+// Check for UniFi OS / Network updates every 30 minutes
+#define UPDATE_CHECK_INTERVAL_MS  1800000UL
 ```
 
 > **Tip:** Create a dedicated API key for this device in UniFi OS → Settings → API Keys.
@@ -117,9 +126,15 @@ Headers: `X-API-KEY: …` and `Accept: application/json`
 - `rx_bytes-r` — bytes/sec received (download / IN)
 - `tx_bytes-r` — bytes/sec transmitted (upload / OUT)
 
-The top line `Clients :#` is derived from health subsystem counts (`wlan`/`lan` user totals when available).
+The `Clients:` panel value is derived from health subsystem counts (`wlan`/`lan` user totals when available).
+`WAN UPTIME` is parsed from WAN health uptime/availability fields when exposed by the UniFi API.
 
 Conversion: `Mbps = bytes_per_sec × 8 ÷ 1 000 000`
+
+### Update availability
+
+Every `UPDATE_CHECK_INTERVAL_MS` (default 30 minutes), the sketch checks UniFi update status endpoints.
+If an update flag is detected, the display shows `UPDATE` in the bottom-right corner.
 
 ---
 

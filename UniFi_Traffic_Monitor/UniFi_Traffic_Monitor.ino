@@ -56,8 +56,11 @@ static int    g_fetchErrors    = 0;
 static float  g_inMbps         = 0.0f;
 static float  g_outMbps        = 0.0f;
 static int    g_clients        = -1;
+static float  g_wanUptimePct   = -1.0f;
+static bool   g_updateAvailable = false;
 static String g_statusMsg      = "Connecting...";
 static unsigned long g_lastPoll = 0;
+static unsigned long g_lastUpdateCheck = 0;
 
 // ---------------------------------------------------------------------------
 // Waveform history  (one sample per horizontal pixel = 128 columns)
@@ -75,7 +78,15 @@ bool  wifiConnect();
 void  initHttpClient();
 void  closeConnection();
 bool  fetchTrafficStats();
-void  drawSineInBox(int leftX, int rightX, int topY, int bottomY, float phase);
+bool  fetchUpdateAvailability(bool& updateAvailable);
+bool  fetchJsonPayload(const String& url, String& payload, int& httpCode);
+bool  keyLooksLikeUpdate(const char* key);
+bool  valueLooksAvailable(JsonVariantConst value);
+bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false);
+bool  parsePercentValue(JsonVariantConst value, float& pct);
+bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
+float historyPeak(float* history);
+void  drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int bottomY, float scalePeakMbps);
 void  drawDisplay();
 void  drawError(const String& line1, const String& line2 = "");
 
@@ -134,6 +145,18 @@ void loop() {
       }
     } else {
       g_fetchErrors = 0;
+    }
+
+    if (g_lastUpdateCheck == 0 || (millis() - g_lastUpdateCheck >= UPDATE_CHECK_INTERVAL_MS)) {
+      bool updateAvailable = false;
+      bool checkOk = fetchUpdateAvailability(updateAvailable);
+      if (checkOk) {
+        g_updateAvailable = updateAvailable;
+        Serial.printf("[Update] available=%s\n", g_updateAvailable ? "yes" : "no");
+      } else {
+        Serial.println("[Update] check failed; keeping previous state");
+      }
+      g_lastUpdateCheck = millis();
     }
 
     drawDisplay();
@@ -300,6 +323,14 @@ bool fetchTrafficStats() {
       g_histIdx = (g_histIdx + 1) % GRAPH_SAMPLES;
 
       Serial.printf("[Stats] IN=%.2f Mbps  OUT=%.2f Mbps\n", g_inMbps, g_outMbps);
+
+      float wanUptime = -1.0f;
+      if (extractWanUptime24h(subsys.as<JsonObjectConst>(), wanUptime)) {
+        g_wanUptimePct = wanUptime;
+      } else {
+        g_wanUptimePct = -1.0f;
+      }
+
       g_statusMsg = "OK";
       foundWan = true;
     }
@@ -323,6 +354,211 @@ bool fetchTrafficStats() {
   return true;
 }
 
+bool fetchJsonPayload(const String& url, String& payload, int& httpCode) {
+  if (!g_httpInitialised) initHttpClient();
+
+  if (!g_http.begin(g_secureClient, url)) {
+    Serial.println("[UniFi] http.begin failed during update check");
+    closeConnection();
+    initHttpClient();
+    httpCode = -1;
+    return false;
+  }
+
+  g_http.addHeader("X-API-KEY", UNIFI_API_KEY);
+  g_http.addHeader("Accept", "application/json");
+  g_http.setTimeout(8000);
+
+  httpCode = g_http.GET();
+  if (httpCode == 200) {
+    payload = g_http.getString();
+    return true;
+  }
+
+  if (httpCode <= 0) {
+    Serial.printf("[Update] connection error %d; rebuilding TLS\n", httpCode);
+    closeConnection();
+    initHttpClient();
+  }
+
+  return false;
+}
+
+bool keyLooksLikeUpdate(const char* key) {
+  if (!key) return false;
+  String k = key;
+  k.toLowerCase();
+  return (k.indexOf("update") >= 0) || (k.indexOf("upgrade") >= 0) || (k.indexOf("upgradable") >= 0);
+}
+
+bool valueLooksAvailable(JsonVariantConst value) {
+  if (value.is<bool>()) {
+    return value.as<bool>();
+  }
+
+  if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
+    return value.as<double>() > 0.0;
+  }
+
+  if (value.is<const char*>()) {
+    String s = value.as<const char*>();
+    s.toLowerCase();
+    return (s == "true") || (s == "yes") || (s == "available") || (s == "pending") || (s == "required");
+  }
+
+  return false;
+}
+
+bool jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey) {
+  if (node.is<JsonObjectConst>()) {
+    JsonObjectConst obj = node.as<JsonObjectConst>();
+    for (JsonPairConst kv : obj) {
+      const char* key = kv.key().c_str();
+      JsonVariantConst child = kv.value();
+      bool thisKeyIsUpdate = keyLooksLikeUpdate(key);
+
+      if (thisKeyIsUpdate && valueLooksAvailable(child)) {
+        return true;
+      }
+
+      if (jsonContainsUpdateAvailable(child, parentIsUpdateKey || thisKeyIsUpdate)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (node.is<JsonArrayConst>()) {
+    JsonArrayConst arr = node.as<JsonArrayConst>();
+    for (JsonVariantConst item : arr) {
+      if (jsonContainsUpdateAvailable(item, parentIsUpdateKey)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (parentIsUpdateKey) {
+    return valueLooksAvailable(node);
+  }
+
+  return false;
+}
+
+bool fetchUpdateAvailability(bool& updateAvailable) {
+  updateAvailable = false;
+
+  String base = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT;
+  String endpoint1 = base + "/api/system/updates";
+  String endpoint2 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo";
+
+  const String endpoints[2] = {endpoint1, endpoint2};
+  bool anySuccess = false;
+
+  for (int i = 0; i < 2; i++) {
+    String payload;
+    int httpCode = 0;
+    bool ok = fetchJsonPayload(endpoints[i], payload, httpCode);
+
+    if (httpCode == 401 || httpCode == 403) {
+      Serial.println("[Update] API key rejected during update check");
+      continue;
+    }
+
+    if (!ok) {
+      if (httpCode > 0) {
+        Serial.printf("[Update] endpoint %d returned HTTP %d\n", i + 1, httpCode);
+      }
+      continue;
+    }
+
+    DynamicJsonDocument doc(24576);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+      Serial.printf("[Update] JSON parse error on endpoint %d: %s\n", i + 1, err.c_str());
+      continue;
+    }
+
+    anySuccess = true;
+    if (jsonContainsUpdateAvailable(doc.as<JsonVariantConst>())) {
+      updateAvailable = true;
+      return true;
+    }
+  }
+
+  return anySuccess;
+}
+
+bool parsePercentValue(JsonVariantConst value, float& pct) {
+  if (value.isNull()) return false;
+
+  if (value.is<float>() || value.is<double>() || value.is<int>() || value.is<long>()) {
+    double v = value.as<double>();
+    if (v >= 0.0 && v <= 1.0) v *= 100.0;  // ratio → percent
+    if (v < 0.0 || v > 100.0) return false;
+    pct = (float)v;
+    return true;
+  }
+
+  if (value.is<const char*>()) {
+    String s = value.as<const char*>();
+    s.trim();
+    s.replace("%", "");
+    if (s.length() == 0) return false;
+
+    char* endPtr = nullptr;
+    double v = strtod(s.c_str(), &endPtr);
+    if (endPtr == s.c_str()) return false;
+    if (v >= 0.0 && v <= 1.0) v *= 100.0;
+    if (v < 0.0 || v > 100.0) return false;
+    pct = (float)v;
+    return true;
+  }
+
+  return false;
+}
+
+bool extractWanUptime24h(JsonObjectConst wanObj, float& pct) {
+  // Common direct key names seen across UniFi API versions
+  const char* directKeys[] = {
+    "uptime_24h",
+    "wan_uptime_24h",
+    "uptime24h",
+    "availability_24h",
+    "wan_availability_24h",
+    "wan_uptime",
+    "uptime",
+    "availability"
+  };
+
+  for (size_t i = 0; i < sizeof(directKeys) / sizeof(directKeys[0]); i++) {
+    JsonVariantConst v = wanObj[directKeys[i]];
+    if (parsePercentValue(v, pct)) return true;
+  }
+
+  // UniFi often nests these inside uptime_stats
+  JsonVariantConst stats = wanObj["uptime_stats"];
+  if (stats.is<JsonObjectConst>()) {
+    JsonObjectConst obj = stats.as<JsonObjectConst>();
+
+    const char* statKeys[] = {"WAN", "wan", "internet", "24h", "last_24h", "24hr"};
+    for (size_t i = 0; i < sizeof(statKeys) / sizeof(statKeys[0]); i++) {
+      JsonVariantConst v = obj[statKeys[i]];
+      if (parsePercentValue(v, pct)) return true;
+    }
+
+    for (JsonPairConst kv : obj) {
+      String key = kv.key().c_str();
+      key.toLowerCase();
+      if (key.indexOf("wan") >= 0 || key.indexOf("uptime") >= 0 || key.indexOf("24") >= 0) {
+        if (parsePercentValue(kv.value(), pct)) return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 // ===========================================================================
 // Display
 // ===========================================================================
@@ -338,43 +574,65 @@ static void formatRate(float mbps, char* buf, size_t bufLen) {
   }
 }
 
+static void formatCompactRate(float mbps, char* buf, size_t bufLen) {
+  if (mbps < 1.0f) {
+    snprintf(buf, bufLen, "%.0fK", mbps * 1000.0f);
+  } else if (mbps < 10.0f) {
+    snprintf(buf, bufLen, "%.1fM", mbps);
+  } else {
+    snprintf(buf, bufLen, "%.0fM", mbps);
+  }
+}
+
 /*
- * Draw a subtle animated sine-wave background confined to one box.
+ * Draw real traffic history as a line graph confined to one box.
  */
-void drawSineInBox(int leftX, int rightX, int topY, int bottomY, float phase) {
+float historyPeak(float* history) {
+  float peak = 0.1f;
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    if (history[i] > peak) peak = history[i];
+  }
+  return peak;
+}
+
+void drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int bottomY, float scalePeakMbps) {
   int w = rightX - leftX;
   int h = bottomY - topY;
   if (w < 10 || h < 8) return;
 
-  float t = millis() * 0.0035f;
-  float amp = h / 4.0f;
-  if (amp < 2.0f) amp = 2.0f;
+  float peak = scalePeakMbps;
+  if (peak < 0.1f) peak = 0.1f;
 
-  int prevX = leftX + 1;
-  int prevY = -1;
+  int graphPixels = w - 2;
+  int sampleCount = GRAPH_SAMPLES;
+  int prevX = 0;
+  int prevY = 0;
   bool hasPrev = false;
 
-  for (int x = leftX + 1; x < rightX; x++) {
-    float localX = (float)(x - leftX);
-    float yMain = topY + (h * 0.55f) + sinf((localX * 0.22f) + t + phase) * amp;
+  for (int i = 0; i < graphPixels; i++) {
+    int x = leftX + 1 + i;
 
-    int y1 = (int)yMain;
+    // oldest sample at g_histIdx, newest at (g_histIdx-1)
+    int sampleOffset = (i * sampleCount) / graphPixels;
+    int sampleIdx = (g_histIdx + sampleOffset) % sampleCount;
+    float v = history[sampleIdx];
 
-    if (y1 <= topY) y1 = topY + 1;
-    if (y1 >= bottomY) y1 = bottomY - 1;
+    int y = bottomY - 1 - (int)((v / peak) * (h - 2));
+    if (y <= topY) y = topY + 1;
+    if (y >= bottomY) y = bottomY - 1;
 
     if (hasPrev) {
-      u8g2.drawLine(prevX, prevY, x, y1);
+      u8g2.drawLine(prevX, prevY, x, y);
     }
 
     prevX = x;
-    prevY = y1;
+    prevY = y;
     hasPrev = true;
   }
 }
 
 void drawDisplay() {
-  char bufIn[16], bufOut[16], clientBuf[20];
+  char bufIn[16], bufOut[16], clientBuf[20], uptimeBuf[12], peakBuf[10], maxBuf[16];
   formatRate(g_inMbps,  bufIn,  sizeof(bufIn));
   formatRate(g_outMbps, bufOut, sizeof(bufOut));
 
@@ -390,9 +648,14 @@ void drawDisplay() {
   u8g2.drawHLine(1, 11, splitX - 1);
   u8g2.drawHLine(1, 37, splitX - 1);
 
-  // Sine-wave background per IN/OUT box only
-  drawSineInBox(leftInnerL, leftInnerR, 12, 36, 0.0f);
-  drawSineInBox(leftInnerL, leftInnerR, 38, 62, 1.5f);
+  // Real traffic graphs per IN/OUT box, using a shared vertical scale
+  float sharedPeak = historyPeak(g_inHistory);
+  float outPeak = historyPeak(g_outHistory);
+  if (outPeak > sharedPeak) sharedPeak = outPeak;
+  formatCompactRate(sharedPeak, peakBuf, sizeof(peakBuf));
+
+  drawTrafficGraphInBox(g_inHistory,  leftInnerL, leftInnerR, 12, 36, sharedPeak);
+  drawTrafficGraphInBox(g_outHistory, leftInnerL, leftInnerR, 38, 62, sharedPeak);
 
   // Left column title + traffic values
   u8g2.setFont(u8g2_font_4x6_tf);
@@ -406,6 +669,12 @@ void drawDisplay() {
   u8g2.drawStr((splitX - inW) / 2, 33, bufIn);
 
   u8g2.drawStr(4, 46, "\x1a OUT");
+  u8g2.setFont(u8g2_font_4x6_tf);
+  snprintf(maxBuf, sizeof(maxBuf), "M %s", peakBuf);
+  int maxW = u8g2.getStrWidth(maxBuf);
+  u8g2.drawStr(splitX - maxW - 2, 40, maxBuf);
+
+  u8g2.setFont(u8g2_font_5x8_tf);
   int outW = u8g2.getStrWidth(bufOut);
   u8g2.drawStr((splitX - outW) / 2, 59, bufOut);
 
@@ -424,6 +693,26 @@ void drawDisplay() {
   u8g2.setFont(u8g2_font_6x10_tf);
   int clientW = u8g2.getStrWidth(clientBuf);
   u8g2.drawStr(rightCenterX - (clientW / 2), 17, clientBuf);
+
+  u8g2.setFont(u8g2_font_4x6_tf);
+  const char* uptimeTitle = "WAN UPTIME";
+  int uptimeTitleW = u8g2.getStrWidth(uptimeTitle);
+  u8g2.drawStr(rightCenterX - (uptimeTitleW / 2), 34, uptimeTitle);
+
+  if (g_wanUptimePct >= 0.0f) {
+    snprintf(uptimeBuf, sizeof(uptimeBuf), "%.1f%%", g_wanUptimePct);
+  } else {
+    snprintf(uptimeBuf, sizeof(uptimeBuf), "--.-%%");
+  }
+  int uptimeW = u8g2.getStrWidth(uptimeBuf);
+  u8g2.drawStr(rightCenterX - (uptimeW / 2), 43, uptimeBuf);
+
+  if (g_updateAvailable) {
+    u8g2.setFont(u8g2_font_4x6_tf);
+    const char* updateTxt = "UPDATE";
+    int updateW = u8g2.getStrWidth(updateTxt);
+    u8g2.drawStr(127 - updateW, 63, updateTxt);
+  }
 
   // ── Status (bottom-left, only on error) ──────────────────────────────────
   if (g_statusMsg != "OK") {

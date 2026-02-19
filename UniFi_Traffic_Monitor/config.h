@@ -41,3 +41,7 @@
 
 // Consecutive fetch failures before the TLS connection is rebuilt
 #define MAX_FETCH_ERRORS  3
+
+// How often to check if UniFi OS / Network updates are available
+// 30 minutes = 1,800,000 ms
+#define UPDATE_CHECK_INTERVAL_MS  1800000UL
