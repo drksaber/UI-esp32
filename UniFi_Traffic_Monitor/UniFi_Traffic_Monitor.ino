@@ -75,7 +75,7 @@ bool  wifiConnect();
 void  initHttpClient();
 void  closeConnection();
 bool  fetchTrafficStats();
-void  drawBackgroundSine(int topY, int bottomY);
+void  drawSineInBox(int leftX, int rightX, int topY, int bottomY, float phase);
 void  drawDisplay();
 void  drawError(const String& line1, const String& line2 = "");
 
@@ -339,25 +339,27 @@ static void formatRate(float mbps, char* buf, size_t bufLen) {
 }
 
 /*
- * Draw a subtle animated sine-wave background behind the text blocks.
+ * Draw a subtle animated sine-wave background confined to one box.
  */
-void drawBackgroundSine(int topY, int bottomY) {
+void drawSineInBox(int leftX, int rightX, int topY, int bottomY, float phase) {
+  int w = rightX - leftX;
   int h = bottomY - topY;
-  if (h < 8) return;
+  if (w < 10 || h < 8) return;
 
   float t = millis() * 0.0035f;
-  float baseAmp = (h / 2.8f);
-  if (baseAmp < 2.0f) baseAmp = 2.0f;
+  float amp = h / 4.0f;
+  if (amp < 2.0f) amp = 2.0f;
 
-  for (int x = 1; x < 127; x++) {
-    float yMain = topY + (h * 0.40f) + sinf((x * 0.18f) + t) * baseAmp;
-    float ySub  = topY + (h * 0.65f) + sinf((x * 0.10f) - (t * 1.4f)) * (baseAmp * 0.55f);
+  for (int x = leftX + 1; x < rightX; x++) {
+    float localX = (float)(x - leftX);
+    float yMain = topY + (h * 0.42f) + sinf((localX * 0.22f) + t + phase) * amp;
+    float ySub  = topY + (h * 0.68f) + sinf((localX * 0.12f) - (t * 1.5f) + phase) * (amp * 0.45f);
 
     int y1 = (int)yMain;
     int y2 = (int)ySub;
 
-    if (y1 >= topY && y1 <= bottomY && (x % 2 == 0)) u8g2.drawPixel(x, y1);
-    if (y2 >= topY && y2 <= bottomY && (x % 3 == 0)) u8g2.drawPixel(x, y2);
+    if (y1 > topY && y1 < bottomY && (x % 2 == 0)) u8g2.drawPixel(x, y1);
+    if (y2 > topY && y2 < bottomY && (x % 3 == 0)) u8g2.drawPixel(x, y2);
   }
 }
 
@@ -368,33 +370,50 @@ void drawDisplay() {
 
   u8g2.clearBuffer();
 
-  // Background first, then frame + content on top
-  drawBackgroundSine(1, 62);
+  // Two-column layout: left 2/3 traffic, right 1/3 clients
+  const int splitX = 85;
+  const int leftInnerL = 1;
+  const int leftInnerR = splitX - 1;
+
   u8g2.drawFrame(0, 0, 128, 64);
-  u8g2.drawHLine(1, 15, 126);
-  u8g2.drawHLine(1, 39, 126);
+  u8g2.drawVLine(splitX, 0, 64);
+  u8g2.drawHLine(1, 11, splitX - 1);
+  u8g2.drawHLine(1, 37, splitX - 1);
 
+  // Sine-wave background per IN/OUT box only
+  drawSineInBox(leftInnerL, leftInnerR, 12, 36, 0.0f);
+  drawSineInBox(leftInnerL, leftInnerR, 38, 62, 1.5f);
+
+  // Left column title + traffic values
   u8g2.setFont(u8g2_font_4x6_tf);
-  if (g_clients >= 0) {
-    snprintf(clientBuf, sizeof(clientBuf), "Clients :%d", g_clients);
-  } else {
-    snprintf(clientBuf, sizeof(clientBuf), "Clients :-");
-  }
-  u8g2.drawStr(3, 6, clientBuf);
-
-  u8g2.setFont(u8g2_font_6x10_tf);
   const char* title = "INTERNET TRAFFIC";
   int titleW = u8g2.getStrWidth(title);
-  u8g2.drawStr((128 - titleW) / 2, 13, title);
+  u8g2.drawStr((splitX - titleW) / 2, 6, title);
 
   u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(6, 25, "\x19 IN");
+  u8g2.drawStr(4, 20, "\x19 IN");
   int inW = u8g2.getStrWidth(bufIn);
-  u8g2.drawStr((128 - inW) / 2, 36, bufIn);
+  u8g2.drawStr((splitX - inW) / 2, 33, bufIn);
 
-  u8g2.drawStr(6, 49, "\x1a OUT");
+  u8g2.drawStr(4, 46, "\x1a OUT");
   int outW = u8g2.getStrWidth(bufOut);
-  u8g2.drawStr((128 - outW) / 2, 60, bufOut);
+  u8g2.drawStr((splitX - outW) / 2, 59, bufOut);
+
+  // Right column clients panel
+  u8g2.setFont(u8g2_font_4x6_tf);
+  const char* clientsTitle = "Clients:";
+  int clientsTitleW = u8g2.getStrWidth(clientsTitle);
+  int rightCenterX = splitX + ((128 - splitX) / 2);
+  u8g2.drawStr(rightCenterX - (clientsTitleW / 2), 8, clientsTitle);
+
+  if (g_clients >= 0) {
+    snprintf(clientBuf, sizeof(clientBuf), "%d", g_clients);
+  } else {
+    snprintf(clientBuf, sizeof(clientBuf), "-");
+  }
+  u8g2.setFont(u8g2_font_6x10_tf);
+  int clientW = u8g2.getStrWidth(clientBuf);
+  u8g2.drawStr(rightCenterX - (clientW / 2), 15, clientBuf);
 
   // ── Status (bottom-left, only on error) ──────────────────────────────────
   if (g_statusMsg != "OK") {
