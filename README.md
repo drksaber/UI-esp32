@@ -9,8 +9,8 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG
 ```
 ┌────────────────────────────────┐
 │ INTERNET TRAFFIC    │ Clients: │
-├─────────────────────┤    12    │
-│ ▼ IN                │          │
+├─────────────────────┤          │
+│ ▼ IN                │    12    │
 │   ~~~ 12.45 Mbps ~~ │          │
 ├─────────────────────┤          │
 │ ▲ OUT               │          │
@@ -19,7 +19,7 @@ Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG
 ```
 
 The panel uses a split layout: **left 2/3** for internet traffic and **right 1/3** for clients.
-The vertical divider spans the full panel height, with the client value directly below `Clients:`.
+The vertical divider spans the full panel height, with the client value slightly below `Clients:`.
 Animated sine waves are drawn only inside the **IN** and **OUT** boxes.
 
 Values automatically switch between **Kbps** and **Mbps** depending on the magnitude.

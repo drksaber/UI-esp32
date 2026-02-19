@@ -350,16 +350,26 @@ void drawSineInBox(int leftX, int rightX, int topY, int bottomY, float phase) {
   float amp = h / 4.0f;
   if (amp < 2.0f) amp = 2.0f;
 
+  int prevX = leftX + 1;
+  int prevY = -1;
+  bool hasPrev = false;
+
   for (int x = leftX + 1; x < rightX; x++) {
     float localX = (float)(x - leftX);
-    float yMain = topY + (h * 0.42f) + sinf((localX * 0.22f) + t + phase) * amp;
-    float ySub  = topY + (h * 0.68f) + sinf((localX * 0.12f) - (t * 1.5f) + phase) * (amp * 0.45f);
+    float yMain = topY + (h * 0.55f) + sinf((localX * 0.22f) + t + phase) * amp;
 
     int y1 = (int)yMain;
-    int y2 = (int)ySub;
 
-    if (y1 > topY && y1 < bottomY && (x % 2 == 0)) u8g2.drawPixel(x, y1);
-    if (y2 > topY && y2 < bottomY && (x % 3 == 0)) u8g2.drawPixel(x, y2);
+    if (y1 <= topY) y1 = topY + 1;
+    if (y1 >= bottomY) y1 = bottomY - 1;
+
+    if (hasPrev) {
+      u8g2.drawLine(prevX, prevY, x, y1);
+    }
+
+    prevX = x;
+    prevY = y1;
+    hasPrev = true;
   }
 }
 
@@ -413,7 +423,7 @@ void drawDisplay() {
   }
   u8g2.setFont(u8g2_font_6x10_tf);
   int clientW = u8g2.getStrWidth(clientBuf);
-  u8g2.drawStr(rightCenterX - (clientW / 2), 15, clientBuf);
+  u8g2.drawStr(rightCenterX - (clientW / 2), 17, clientBuf);
 
   // ── Status (bottom-left, only on error) ──────────────────────────────────
   if (g_statusMsg != "OK") {
