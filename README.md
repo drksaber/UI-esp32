@@ -107,9 +107,11 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
 
 // Status LED (uses LED_BUILTIN by default)
+#define STATUS_LED_ENABLED       1
 #define STATUS_LED_PIN           LED_BUILTIN
 #define STATUS_LED_ACTIVE_LOW    0
 #define LED_WORKING_BLINK_MS     250UL
+#define LED_WAN_DOWN_BLINK_MS    70UL
 #define LED_OK_HEARTBEAT_MS      30000UL
 #define LED_OK_PULSE_MS          120UL
 ```
@@ -146,8 +148,11 @@ If an update flag is detected, the display shows `UPDATE` in the bottom-right co
 ### Status LED behavior
 
 - Loading / connecting to WiFi: fast blink
+- WAN down (API reachable): super-fast blink
 - Healthy (`fetchTrafficStats()` successful): heartbeat blink every 30 seconds
 - API/connectivity error: solid ON
+
+Set `STATUS_LED_ENABLED` to `0` in `config.h` to disable all LED behavior.
 
 ---
 
