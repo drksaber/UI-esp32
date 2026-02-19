@@ -59,12 +59,22 @@ static String g_statusMsg      = "Connecting...";
 static unsigned long g_lastPoll = 0;
 
 // ---------------------------------------------------------------------------
+// Waveform history  (one sample per horizontal pixel = 128 columns)
+// ---------------------------------------------------------------------------
+#define GRAPH_SAMPLES 128
+
+static float g_inHistory[GRAPH_SAMPLES]  = {0};
+static float g_outHistory[GRAPH_SAMPLES] = {0};
+static int   g_histIdx = 0;  // index where the NEXT sample will be written
+
+// ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
 bool  wifiConnect();
 void  initHttpClient();
 void  closeConnection();
 bool  fetchTrafficStats();
+void  drawWaveform(float* history, int graphTop, int graphBottom);
 void  drawDisplay();
 void  drawError(const String& line1, const String& line2 = "");
 
@@ -262,6 +272,11 @@ bool fetchTrafficStats() {
       g_inMbps  = rxRate * 8.0f / 1000000.0f;
       g_outMbps = txRate * 8.0f / 1000000.0f;
 
+      // Push into waveform ring buffers
+      g_inHistory[g_histIdx]  = g_inMbps;
+      g_outHistory[g_histIdx] = g_outMbps;
+      g_histIdx = (g_histIdx + 1) % GRAPH_SAMPLES;
+
       Serial.printf("[Stats] IN=%.2f Mbps  OUT=%.2f Mbps\n", g_inMbps, g_outMbps);
       g_statusMsg = "OK";
       foundWan = true;
@@ -283,39 +298,56 @@ bool fetchTrafficStats() {
 // ===========================================================================
 
 /*
- * Draw a downward-pointing filled triangle (download arrow).
- * (cx, ty) = center-x, top y
- */
-static void drawArrowDown(int cx, int ty) {
-  // Triangle: flat top, point at bottom
-  // Top-left (cx-5, ty), Top-right (cx+5, ty), Tip (cx, ty+8)
-  u8g2.drawTriangle(cx - 5, ty, cx + 5, ty, cx, ty + 8);
-}
-
-/*
- * Draw an upward-pointing filled triangle (upload arrow).
- * (cx, by) = center-x, bottom y
- */
-static void drawArrowUp(int cx, int by) {
-  // Tip at top, flat base at bottom
-  u8g2.drawTriangle(cx, by - 8, cx - 5, by, cx + 5, by);
-}
-
-/*
- * Format a Mbps value into a human-readable string.
- *   < 1 Mbps   → show in Kbps
- *   >= 1 Mbps  → "xxx.xx Mbps"
+ * Format a Mbps value into a compact human-readable string.
  */
 static void formatMbps(float mbps, char* buf, size_t bufLen) {
   if (mbps < 1.0f) {
-    float kbps = mbps * 1000.0f;
-    snprintf(buf, bufLen, "%.1f Kbps", kbps);
+    snprintf(buf, bufLen, "%.0fK", mbps * 1000.0f);
   } else if (mbps < 10.0f) {
-    snprintf(buf, bufLen, "%.2f Mbps", mbps);
+    snprintf(buf, bufLen, "%.2fM", mbps);
   } else if (mbps < 100.0f) {
-    snprintf(buf, bufLen, "%.1f Mbps", mbps);
+    snprintf(buf, bufLen, "%.1fM", mbps);
   } else {
-    snprintf(buf, bufLen, "%.0f Mbps", mbps);
+    snprintf(buf, bufLen, "%.0fM", mbps);
+  }
+}
+
+/*
+ * Draw a scrolling waveform for one channel.
+ *
+ * history[]    – ring buffer, g_histIdx next-write pointer
+ * graphTop     – topmost pixel row of the graph area (inclusive)
+ * graphBottom  – bottommost pixel row of the graph area (inclusive)
+ *
+ * Samples are auto-scaled to the peak value currently in the buffer
+ * (minimum scale 0.1 Mbps so idle flatline sits at the bottom, not mid).
+ * Each adjacent pair of samples is connected with a drawLine(), giving
+ * the classic network-monitor waveform look.
+ */
+void drawWaveform(float* history, int graphTop, int graphBottom) {
+  int graphH = graphBottom - graphTop;  // usable pixel height
+
+  // Find peak value for auto-scaling
+  float peak = 0.1f;
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    if (history[i] > peak) peak = history[i];
+  }
+
+  // Map sample index → y pixel (higher value = higher on screen = lower y)
+  // oldest sample is at g_histIdx, newest at (g_histIdx-1+N)%N
+  auto sampleY = [&](int sampleIdx) -> int {
+    float v = history[(g_histIdx + sampleIdx) % GRAPH_SAMPLES];
+    int y = graphBottom - (int)((v / peak) * graphH);
+    if (y < graphTop)    y = graphTop;
+    if (y > graphBottom) y = graphBottom;
+    return y;
+  };
+
+  // Draw connected line segments across all 128 columns
+  for (int x = 0; x < GRAPH_SAMPLES - 1; x++) {
+    int y0 = sampleY(x);
+    int y1 = sampleY(x + 1);
+    u8g2.drawLine(x, y0, x + 1, y1);
   }
 }
 
@@ -324,59 +356,43 @@ static void formatMbps(float mbps, char* buf, size_t bufLen) {
  *
  *  Layout (128×64)
  *  ┌────────────────────────────────┐  y=0
- *  │      INTERNET TRAFFIC          │  y≈9   (6×10 font, centered)
- *  ├────────────────────────────────┤  y=11  (horizontal rule)
- *  │ ▼ IN                           │  y=21  (label, 5×8 font)
- *  │       xxx.xx Mbps              │  y=34  (value, 8×13B font, centered)
- *  ├────────────────────────────────┤  y=37  (horizontal rule)
- *  │ ▲ OUT                          │  y=47  (label)
- *  │       xxx.xx Mbps              │  y=60  (value)
- *  └────────────────────────────────┘  y=63
+ *  │ ▼IN          12.45M            │  y=0-9   (label + value, 5×8 font)
+ *  ├────────────────────────────────┤  y=10
+ *  │   [waveform IN – 20 px tall]   │  y=11-30
+ *  ├────────────────────────────────┤  y=31
+ *  │ ▲OUT          3.56M            │  y=32-41
+ *  ├────────────────────────────────┤  y=42
+ *  │   [waveform OUT – 21 px tall]  │  y=43-63
+ *  └────────────────────────────────┘
  * ────────────────────────────────────────────────────────────────────────*/
 void drawDisplay() {
-  char bufIn[20], bufOut[20];
+  char bufIn[12], bufOut[12];
   formatMbps(g_inMbps,  bufIn,  sizeof(bufIn));
   formatMbps(g_outMbps, bufOut, sizeof(bufOut));
 
   u8g2.clearBuffer();
-
-  // ── Title ────────────────────────────────────────────────────────────────
-  u8g2.setFont(u8g2_font_6x10_tf);
-  const char* title = "INTERNET TRAFFIC";
-  int titleW = u8g2.getStrWidth(title);
-  u8g2.drawStr((128 - titleW) / 2, 9, title);
-
-  // ── Horizontal rules ─────────────────────────────────────────────────────
-  u8g2.drawHLine(0, 11, 128);
-  u8g2.drawHLine(0, 37, 128);
-
-  // ── IN section ───────────────────────────────────────────────────────────
-  // Arrow
-  drawArrowDown(8, 14);      // tiny down-arrow at left
-
-  // Label "IN"
   u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(18, 21, "IN");
 
-  // Value (centered, bold, medium)
-  u8g2.setFont(u8g2_font_8x13B_tf);
+  // ── IN header row ────────────────────────────────────────────────────────
+  u8g2.drawStr(0, 8, "\x19 IN");           // ↓ arrow glyph + label (baseline y=8)
   int inW = u8g2.getStrWidth(bufIn);
-  u8g2.drawStr((128 - inW) / 2, 34, bufIn);
+  u8g2.drawStr(127 - inW, 8, bufIn);       // value right-aligned
 
-  // ── OUT section ──────────────────────────────────────────────────────────
-  // Arrow
-  drawArrowUp(8, 48);        // tiny up-arrow at left
+  // ── Dividers ─────────────────────────────────────────────────────────────
+  u8g2.drawHLine(0, 10, 128);
+  u8g2.drawHLine(0, 31, 128);
+  u8g2.drawHLine(0, 42, 128);
 
-  // Label "OUT"
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(18, 47, "OUT");
-
-  // Value
-  u8g2.setFont(u8g2_font_8x13B_tf);
+  // ── OUT header row ───────────────────────────────────────────────────────
+  u8g2.drawStr(0, 40, "\x1a OUT");          // ↑ arrow glyph + label (baseline y=40)
   int outW = u8g2.getStrWidth(bufOut);
-  u8g2.drawStr((128 - outW) / 2, 60, bufOut);
+  u8g2.drawStr(127 - outW, 40, bufOut);    // value right-aligned
 
-  // ── Status dot (top-right corner, only when there's an issue) ────────────
+  // ── Waveforms ────────────────────────────────────────────────────────────
+  drawWaveform(g_inHistory,  11, 30);      // IN  graph: rows 11-30
+  drawWaveform(g_outHistory, 43, 63);      // OUT graph: rows 43-63
+
+  // ── Status (bottom-left, only on error) ──────────────────────────────────
   if (g_statusMsg != "OK") {
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, g_statusMsg.c_str());
