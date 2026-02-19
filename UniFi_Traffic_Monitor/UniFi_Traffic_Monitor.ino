@@ -31,6 +31,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
 #include <Wire.h>
@@ -48,6 +49,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset */ U8X8_PIN_NONE);
 static WiFiClientSecure g_secureClient;
 static HTTPClient       g_http;
 static bool             g_httpInitialised = false;
+static WebServer        g_web(80);
 
 // ---------------------------------------------------------------------------
 // State
@@ -79,10 +81,22 @@ static bool g_ledPulseActive = false;
 static unsigned long g_ledLastToggle = 0;
 static unsigned long g_ledLastPulseStart = 0;
 
+static bool g_bootLastRawPressed = false;
+static bool g_bootStablePressed = false;
+static unsigned long g_bootLastRawChangeMs = 0;
+static unsigned long g_bootIpOverlayUntilMs = 0;
+static String g_bootIpOverlayMsg = "";
+
+static const int kBootButtonPin = 0;
+static const bool kBootButtonActiveLow = true;
+static const unsigned long kBootButtonDebounceMs = 30UL;
+static const unsigned long kBootButtonIpShowMs = 5000UL;
+
 // ---------------------------------------------------------------------------
 // Waveform history  (one sample per horizontal pixel = 128 columns)
 // ---------------------------------------------------------------------------
 #define GRAPH_SAMPLES 128
+#define WEB_HISTORY_POINTS 96
 
 static float g_inHistory[GRAPH_SAMPLES]  = {0};
 static float g_outHistory[GRAPH_SAMPLES] = {0};
@@ -105,11 +119,17 @@ bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
 bool  parseLatencyValue(JsonVariantConst value, float& latencyMs);
 bool  extractWanLatencyMs(JsonObjectConst wanObj, float& latencyMs);
 bool  isWanSubsysDown(JsonObjectConst wanObj);
+void  initWebServer();
+void  handleWebRoot();
+void  handleWebStats();
+void  appendHistory(JsonArray arr, float* history, int points);
 float historyPeak(float* history);
 void  drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int bottomY, float scalePeakMbps);
 void  ledSet(bool on);
 void  ledSetMode(LedMode mode);
 void  ledUpdate();
+void  initBootButton();
+void  updateBootButton();
 void  drawDisplay();
 void  drawError(const String& line1, const String& line2 = "");
 
@@ -120,6 +140,8 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n[UniFi Traffic Monitor] starting...");
+
+  initBootButton();
 
   if (STATUS_LED_ENABLED) {
     pinMode(STATUS_LED_PIN, OUTPUT);
@@ -141,6 +163,7 @@ void setup() {
 
   // --- Persistent TLS client -----------------------------------------------
   initHttpClient();
+  initWebServer();
 
   Serial.println("[setup] ready.");
 }
@@ -150,6 +173,8 @@ void setup() {
 // ===========================================================================
 void loop() {
   ledUpdate();
+  updateBootButton();
+  g_web.handleClient();
 
   // Reconnect WiFi if lost
   if (WiFi.status() != WL_CONNECTED) {
@@ -335,6 +360,206 @@ bool wifiConnect() {
 
   Serial.printf("\n[WiFi] connected – IP: %s\n", WiFi.localIP().toString().c_str());
   return true;
+}
+
+void initWebServer() {
+  g_web.on("/", HTTP_GET, handleWebRoot);
+  g_web.on("/api/stats", HTTP_GET, handleWebStats);
+  g_web.begin();
+  Serial.printf("[Web] dashboard: http://%s/\n", WiFi.localIP().toString().c_str());
+}
+
+void initBootButton() {
+  if (!BOOT_BUTTON_ENABLED) return;
+
+  if (kBootButtonActiveLow) {
+    pinMode(kBootButtonPin, INPUT_PULLUP);
+  } else {
+    pinMode(kBootButtonPin, INPUT_PULLDOWN);
+  }
+
+  int level = digitalRead(kBootButtonPin);
+  bool pressed = kBootButtonActiveLow ? (level == LOW) : (level == HIGH);
+  g_bootLastRawPressed = pressed;
+  g_bootStablePressed = pressed;
+  g_bootLastRawChangeMs = millis();
+}
+
+void updateBootButton() {
+  if (!BOOT_BUTTON_ENABLED) return;
+
+  unsigned long now = millis();
+  int level = digitalRead(kBootButtonPin);
+  bool rawPressed = kBootButtonActiveLow ? (level == LOW) : (level == HIGH);
+
+  if (rawPressed != g_bootLastRawPressed) {
+    g_bootLastRawPressed = rawPressed;
+    g_bootLastRawChangeMs = now;
+  }
+
+  if (now - g_bootLastRawChangeMs < kBootButtonDebounceMs) {
+    return;
+  }
+
+  if (rawPressed != g_bootStablePressed) {
+    g_bootStablePressed = rawPressed;
+
+    if (g_bootStablePressed) {
+      return;
+    }
+
+    g_bootIpOverlayMsg = "IP: " + WiFi.localIP().toString();
+    g_bootIpOverlayUntilMs = now + kBootButtonIpShowMs;
+    Serial.printf("[BOOT] short press -> show IP: %s\n", g_bootIpOverlayMsg.c_str());
+    drawDisplay();
+    return;
+  }
+}
+
+void handleWebRoot() {
+  static const char page[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UniFi Traffic Monitor</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0f172a; color:#e2e8f0; margin:0; padding:16px; }
+    .grid { display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .card { background:#111827; border:1px solid #334155; border-radius:10px; padding:12px; }
+    .k { color:#94a3b8; font-size:12px; }
+    .v { font-size:24px; font-weight:bold; margin-top:6px; }
+    .row { display:flex; justify-content:space-between; margin:4px 0; }
+    canvas { width:100%; height:120px; background:#020617; border:1px solid #334155; border-radius:8px; }
+    .ok { color:#22c55e; }
+    .warn { color:#f59e0b; }
+    .bad { color:#ef4444; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0 0 12px 0;">UniFi Traffic Monitor</h2>
+  <div class="grid">
+    <div class="card"><div class="k">IN</div><div id="in" class="v">--</div></div>
+    <div class="card"><div class="k">OUT</div><div id="out" class="v">--</div></div>
+    <div class="card"><div class="k">Clients</div><div id="clients" class="v">--</div></div>
+    <div class="card"><div class="k">WAN Uptime (24h)</div><div id="uptime" class="v">--</div></div>
+    <div class="card"><div class="k">WAN Latency</div><div id="latency" class="v">--</div></div>
+    <div class="card"><div class="k">Controller Update</div><div id="update" class="v">--</div></div>
+  </div>
+
+  <div class="grid" style="margin-top:12px;">
+    <div class="card"><div class="k">IN Traffic History</div><canvas id="inChart" width="500" height="120"></canvas></div>
+    <div class="card"><div class="k">OUT Traffic History</div><canvas id="outChart" width="500" height="120"></canvas></div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div class="k">Health</div>
+    <div class="row"><span>WiFi RSSI</span><span id="rssi">--</span></div>
+    <div class="row"><span>IP</span><span id="ip">--</span></div>
+    <div class="row"><span>Status</span><span id="status">--</span></div>
+    <div class="row"><span>WAN Down</span><span id="wanDown">--</span></div>
+    <div class="row"><span>Fetch Errors</span><span id="fetchErr">--</span></div>
+    <div class="row"><span>Free Heap</span><span id="heap">--</span></div>
+    <div class="row"><span>Uptime</span><span id="up">--</span></div>
+  </div>
+
+  <script>
+    function drawLine(canvasId, data, color) {
+      const c = document.getElementById(canvasId);
+      const ctx = c.getContext('2d');
+      const w = c.width, h = c.height;
+      ctx.clearRect(0,0,w,h);
+      if (!data || data.length < 2) return;
+      const peak = Math.max(0.1, ...data);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i=0;i<data.length;i++) {
+        const x = (i/(data.length-1))*(w-1);
+        const y = (h-1) - (Math.min(data[i], peak)/peak)*(h-6) - 3;
+        if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+
+    function fmtMbps(v) {
+      if (v == null || isNaN(v)) return '--';
+      if (v < 1) return (v*1000).toFixed(0) + ' Kbps';
+      return v.toFixed(2) + ' Mbps';
+    }
+
+    async function tick() {
+      try {
+        const res = await fetch('/api/stats', {cache:'no-store'});
+        const d = await res.json();
+        document.getElementById('in').textContent = fmtMbps(d.in_mbps);
+        document.getElementById('out').textContent = fmtMbps(d.out_mbps);
+        document.getElementById('clients').textContent = d.clients >= 0 ? d.clients : '--';
+        document.getElementById('uptime').textContent = d.wan_uptime_pct >= 0 ? d.wan_uptime_pct.toFixed(1)+'%' : '--.-%';
+        document.getElementById('latency').textContent = d.wan_latency_ms >= 0 ? d.wan_latency_ms.toFixed(1)+' ms' : '--.- ms';
+        document.getElementById('update').textContent = d.update_available ? 'UPDATE AVAILABLE' : 'Up to date';
+        document.getElementById('rssi').textContent = d.wifi_rssi + ' dBm';
+        document.getElementById('ip').textContent = d.ip;
+        document.getElementById('status').textContent = d.status;
+        document.getElementById('wanDown').textContent = d.wan_down ? 'YES' : 'NO';
+        document.getElementById('fetchErr').textContent = d.fetch_errors;
+        document.getElementById('heap').textContent = d.heap_free + ' bytes';
+        document.getElementById('up').textContent = d.uptime_s + ' s';
+        drawLine('inChart', d.in_history || [], '#22c55e');
+        drawLine('outChart', d.out_history || [], '#38bdf8');
+      } catch (e) {
+        document.getElementById('status').textContent = 'dashboard fetch error';
+      }
+    }
+
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>
+  )HTML";
+
+  g_web.send(200, "text/html", page);
+}
+
+void appendHistory(JsonArray arr, float* history, int points) {
+  if (points < 1) return;
+  if (points > GRAPH_SAMPLES) points = GRAPH_SAMPLES;
+
+  int oldestIdx = g_histIdx - points;
+  while (oldestIdx < 0) oldestIdx += GRAPH_SAMPLES;
+
+  for (int i = 0; i < points; i++) {
+    int idx = (oldestIdx + i) % GRAPH_SAMPLES;
+    arr.add(history[idx]);
+  }
+}
+
+void handleWebStats() {
+  DynamicJsonDocument doc(16384);
+  doc["in_mbps"] = g_inMbps;
+  doc["out_mbps"] = g_outMbps;
+  doc["clients"] = g_clients;
+  doc["wan_uptime_pct"] = g_wanUptimePct;
+  doc["wan_latency_ms"] = g_wanLatencyMs;
+  doc["wan_down"] = g_wanDown;
+  doc["update_available"] = g_updateAvailable;
+  doc["status"] = g_statusMsg;
+  doc["fetch_errors"] = g_fetchErrors;
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["heap_free"] = ESP.getFreeHeap();
+  doc["uptime_s"] = millis() / 1000UL;
+
+  JsonArray inHist = doc.createNestedArray("in_history");
+  JsonArray outHist = doc.createNestedArray("out_history");
+  appendHistory(inHist, g_inHistory, WEB_HISTORY_POINTS);
+  appendHistory(outHist, g_outHistory, WEB_HISTORY_POINTS);
+
+  String payload;
+  serializeJson(doc, payload);
+  g_web.send(200, "application/json", payload);
 }
 
 // ===========================================================================
@@ -1011,10 +1236,33 @@ void drawDisplay() {
     u8g2.drawStr(127 - updateW, 63, updateTxt);
   }
 
+  bool showBootIpOverlay = ((long)(g_bootIpOverlayUntilMs - millis()) > 0);
+
   // ── Status (bottom-left, only on error) ──────────────────────────────────
-  if (g_statusMsg != "OK") {
+  if (!showBootIpOverlay && g_statusMsg != "OK") {
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, g_statusMsg.c_str());
+  }
+
+  if (showBootIpOverlay) {
+    const int boxW = 112;
+    const int boxH = 24;
+    const int boxX = (128 - boxW) / 2;
+    const int boxY = (64 - boxH) / 2;
+
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(boxX, boxY, boxW, boxH);
+    u8g2.setDrawColor(1);
+    u8g2.drawFrame(boxX, boxY, boxW, boxH);
+
+    const char* popupTitle = "LOCAL IP";
+    u8g2.setFont(u8g2_font_4x6_tf);
+    int titleW = u8g2.getStrWidth(popupTitle);
+    u8g2.drawStr(boxX + (boxW - titleW) / 2, boxY + 8, popupTitle);
+
+    u8g2.setFont(u8g2_font_5x8_tf);
+    int ipW = u8g2.getStrWidth(g_bootIpOverlayMsg.c_str());
+    u8g2.drawStr(boxX + (boxW - ipW) / 2, boxY + 18, g_bootIpOverlayMsg.c_str());
   }
 
   u8g2.sendBuffer();

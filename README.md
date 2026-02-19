@@ -29,6 +29,21 @@ When an update is detected, `UPDATE` appears in the bottom-right corner.
 
 Values automatically switch between **Kbps** and **Mbps** depending on the magnitude.
 
+## Web dashboard
+
+The ESP32 also serves a built-in web dashboard with the same core metrics as the OLED plus additional health info.
+
+- Open: `http://<ESP32_IP>/`
+- Live JSON API: `http://<ESP32_IP>/api/stats`
+
+Dashboard includes:
+- IN / OUT traffic values and history graphs
+- Clients count
+- WAN uptime (24h)
+- WAN latency
+- Update availability
+- Health details (RSSI, IP, fetch errors, status, free heap, uptime)
+
 ---
 
 ## Hardware
@@ -114,6 +129,9 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 #define LED_WAN_DOWN_BLINK_MS    70UL
 #define LED_OK_HEARTBEAT_MS      30000UL
 #define LED_OK_PULSE_MS          120UL
+
+// BOOT button actions (GPIO0 by default)
+#define BOOT_BUTTON_ENABLED       1
 ```
 
 > **Tip:** Create a dedicated API key for this device in UniFi OS → Settings → API Keys.
@@ -153,6 +171,12 @@ If an update flag is detected, the display shows `UPDATE` in the bottom-right co
 - API/connectivity error: solid ON
 
 Set `STATUS_LED_ENABLED` to `0` in `config.h` to disable all LED behavior.
+
+### BOOT button behavior
+
+- Short press: show local IP in a bordered popup on OLED for ~5 seconds
+
+Set `BOOT_BUTTON_ENABLED` to `0` in `config.h` if you do not want any BOOT button actions.
 
 ---
 

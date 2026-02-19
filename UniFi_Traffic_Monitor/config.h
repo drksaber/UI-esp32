@@ -73,3 +73,9 @@
 
 // Width of the heartbeat pulse
 #define LED_OK_PULSE_MS          120UL
+
+// =============================================================
+//  BOOT Button (GPIO0 on most ESP32 dev boards)
+// =============================================================
+// Set to 0 to ignore BOOT button input
+#define BOOT_BUTTON_ENABLED         1
