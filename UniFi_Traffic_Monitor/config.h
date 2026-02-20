@@ -13,28 +13,20 @@
 #define UNIFI_HOST      "192.168.0.1"
 #define UNIFI_PORT      443
 
-// API key – generate in UniFi OS → Settings → API Keys
+// API key - generate in UniFi OS -> Settings -> API Keys
 // (no username/password needed)
 #define UNIFI_API_KEY   "YOUR_API_KEY_HERE"
 
-// Site name – almost always "default" unless you renamed it
+// Site name - almost always "default" unless you renamed it
 #define UNIFI_SITE      "default"
 
-// Optional TLS certificate fingerprint (SHA-1, colon-separated) for the UCG-MAX.
-// If set, the ESP32 will reject connections whose certificate doesn't match –
-// protecting against MITM even on a local network.
-// Retrieve with:
-//   echo | openssl s_client -connect <ip>:443 2>/dev/null | openssl x509 -noout -fingerprint -sha1
-// Leave blank ("") to accept any certificate (default – LAN-trust assumption).
-#define UNIFI_TLS_FINGERPRINT   ""
-
 // =============================================================
-//  Display – SH1106 128×64 I²C
+//  Display - SH1106 128x64 I2C
 // =============================================================
-// Standard I²C address for SH1106 (0x3C or 0x3D)
+// Standard I2C address for SH1106 (0x3C or 0x3D)
 #define OLED_I2C_ADDR   0x3C
 
-// SDA / SCL pins – change if you are NOT using the ESP32 defaults
+// SDA / SCL pins - change if you are NOT using the ESP32 defaults
 // Default ESP32: SDA=21, SCL=22
 #define OLED_SDA_PIN    21
 #define OLED_SCL_PIN    22
@@ -43,7 +35,7 @@
 //  Polling Interval
 // =============================================================
 // How often (milliseconds) to query the UniFi API.
-// 1000 ms is the practical minimum – the UCG-MAX bytes-r stat updates once/sec.
+// 1000 ms is the practical minimum - the UCG-MAX bytes-r stat updates once/sec.
 // The persistent TLS connection eliminates handshake overhead so 1 s is stable.
 #define POLL_INTERVAL_MS  1000
 
@@ -71,7 +63,7 @@
 //  Web Dashboard Authentication
 // =============================================================
 // Set both to non-empty strings to require HTTP Digest Auth on / and /api/stats.
-// Leave blank to allow unauthenticated access (default – LAN-trust assumption).
+// Leave blank to allow unauthenticated access (default - LAN-trust assumption).
 #define WEB_AUTH_USER   ""
 #define WEB_AUTH_PASS   ""
 

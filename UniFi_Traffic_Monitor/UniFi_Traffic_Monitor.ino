@@ -2,23 +2,23 @@
  * UniFi_Traffic_Monitor.ino
  *
  * Displays real-time internet traffic (IN / OUT Mbps) from a Ubiquiti UCG-MAX
- * on a 128×64 SH1106 OLED over I²C.
+ * on a 128x64 SH1106 OLED over I2C.
  *
  * Target hardware : ESP32 (any variant)
- * Display         : SH1106 128×64 I²C (0x3C)
+ * Display         : SH1106 128x64 I2C (0x3C)
  * Controller      : Ubiquiti UCG-MAX (UniFi OS 5.x / Network 10.x)
  *
  * Required libraries (install via Arduino Library Manager):
  *   - U8g2            by oliver  (display driver)
  *   - ArduinoJson     by bblanchon (JSON parsing)
- *   - WiFiClientSecure & HTTPClient – bundled with ESP32 board package
+ *   - WiFiClientSecure & HTTPClient - bundled with ESP32 board package
  *
  * Configuration: edit config.h
  *
  * Auth strategy:
- *   Uses the UniFi OS API key (X-API-KEY header) – no login, no cookies,
+ *   Uses the UniFi OS API key (X-API-KEY header) - no login, no cookies,
  *   no CSRF tokens, no session expiry to manage.
- *   Generate a key in UniFi OS → Settings → API Keys.
+ *   Generate a key in UniFi OS -> Settings -> API Keys.
  *
  * Connection strategy:
  *   A single WiFiClientSecure + HTTPClient pair is kept alive across polls.
@@ -43,7 +43,7 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Display – SH1106 128×64, full-buffer, hardware I²C
+// Display - SH1106 128x64, full-buffer, hardware I2C
 // ---------------------------------------------------------------------------
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset */ U8X8_PIN_NONE);
 
@@ -112,8 +112,9 @@ static const unsigned long kLedWanDownBlinkMs = 70UL;
 static const unsigned long kLedOkHeartbeatMs = 30000UL;
 static const unsigned long kLedOkPulseMs = 120UL;
 static constexpr float kGraphScaleDecayFactor = 0.90f;
-static constexpr float kGraphMinScaleMbps = 0.0001f;
+static constexpr float kGraphMinScaleMbps = 0.1f;   // 100 Kbps floor - prevents scale from collapsing to near-zero
 static constexpr float kRateBpsThresholdMbps = 0.001f;
+static int g_ucgEndpointIdx = 0;  // rotates across resource-stats endpoints, one per cycle
 
 // ---------------------------------------------------------------------------
 // Waveform history  (one sample per horizontal pixel = 128 columns)
@@ -133,7 +134,7 @@ void  initHttpClient();
 void  closeConnection();
 bool  fetchTrafficStats();
 bool  fetchUpdateAvailability(bool& updateAvailable);
-bool  fetchJsonPayload(const String& url, String& payload, int& httpCode);
+bool  fetchJsonPayload(const String& url, String& payload, int& httpCode, int timeoutMs = 8000);
 bool  keyLooksLikeUpdate(const char* key);
 bool  valueLooksAvailable(JsonVariantConst value);
 bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false);
@@ -227,7 +228,7 @@ void loop() {
       ledSetMode(LED_MODE_ERROR);
       g_fetchErrors++;
       if (g_fetchErrors >= MAX_FETCH_ERRORS) {
-        // Persistent failure – tear down TLS and rebuild on next poll
+        // Persistent failure - tear down TLS and rebuild on next poll
         closeConnection();
         initHttpClient();
         g_fetchErrors = 0;
@@ -296,16 +297,10 @@ void loop() {
 
 /*
  * Initialise (or re-initialise) the persistent TLS client.
- * Safe to call multiple times – just resets internal state.
+ * Safe to call multiple times - just resets internal state.
  */
 void initHttpClient() {
-  if (strlen(UNIFI_TLS_FINGERPRINT) > 0) {
-    g_secureClient.setFingerprint(UNIFI_TLS_FINGERPRINT);  // verify UCG-MAX cert
-    Serial.println("[HTTP] TLS fingerprint verification enabled");
-  } else {
-    g_secureClient.setInsecure();   // LAN-trust: accept any cert (see UNIFI_TLS_FINGERPRINT)
-    Serial.println("[HTTP] TLS verification disabled – set UNIFI_TLS_FINGERPRINT to enable");
-  }
+  g_secureClient.setInsecure();   // LAN-trust: accept self-signed UCG-MAX cert
   g_http.setReuse(true);          // keep TCP/TLS connection alive between requests
   g_httpInitialised = true;
   Serial.println("[HTTP] persistent client ready");
@@ -426,7 +421,7 @@ bool wifiConnect() {
     Serial.print('.');
   }
 
-  Serial.printf("\n[WiFi] connected – IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("\n[WiFi] connected - IP: %s\n", WiFi.localIP().toString().c_str());
   return true;
 }
 
@@ -533,7 +528,7 @@ void handleWebRoot() {
     <div class="card"><div class="k">Controller Update</div><div id="update" class="v">--</div></div>
     <div class="card"><div class="k">UCG CPU</div><div id="ucgCpu" class="v">--</div></div>
     <div class="card"><div class="k">UCG Memory</div><div id="ucgMem" class="v">--</div></div>
-    <div class="card"><div class="k">UCG Temp (°F)</div><div id="ucgTemp" class="v">--</div></div>
+    <div class="card"><div class="k">UCG Temp (degF)</div><div id="ucgTemp" class="v">--</div></div>
   </div>
 
   <div class="grid" style="margin-top:12px;">
@@ -589,7 +584,7 @@ void handleWebRoot() {
 
     function fmtTemp(v) {
       if (v == null || isNaN(v) || v < -40) return '--';
-      return v.toFixed(1) + ' °F';
+      return v.toFixed(1) + ' degF';
     }
 
     function fmtAge(v) {
@@ -701,11 +696,11 @@ void handleWebStats() {
  * GET /proxy/network/api/s/{site}/stat/health
  *
  * Authenticated with X-API-KEY header (no login / session management needed).
- * Reuses the persistent TLS connection – no handshake overhead on the hot path.
+ * Reuses the persistent TLS connection - no handshake overhead on the hot path.
  *
  * The "wan" subsystem entry contains:
- *   "rx_bytes-r"  – bytes/sec received  (inbound  / download)
- *   "tx_bytes-r"  – bytes/sec sent      (outbound / upload)
+ *   "rx_bytes-r"  - bytes/sec received  (inbound  / download)
+ *   "tx_bytes-r"  - bytes/sec sent      (outbound / upload)
  */
 bool fetchTrafficStats() {
   if (!g_httpInitialised) initHttpClient();
@@ -715,7 +710,7 @@ bool fetchTrafficStats() {
 
   // begin() on the same host reuses the live TLS socket (no new handshake)
   if (!g_http.begin(g_secureClient, url)) {
-    Serial.println("[UniFi] http.begin failed – reconnecting");
+    Serial.println("[UniFi] http.begin failed - reconnecting");
     closeConnection();
     initHttpClient();
     return false;
@@ -729,7 +724,7 @@ bool fetchTrafficStats() {
   Serial.printf("[UniFi] health HTTP %d\n", httpCode);
 
   if (httpCode == 401 || httpCode == 403) {
-    Serial.println("[UniFi] API key rejected – check UNIFI_API_KEY in config.h");
+    Serial.println("[UniFi] API key rejected - check UNIFI_API_KEY in config.h");
     g_statusMsg = "Bad API key";
     return false;
   }
@@ -748,7 +743,7 @@ bool fetchTrafficStats() {
   }
 
   String payload = g_http.getString();
-  // Do NOT call g_http.end() – keep the socket alive for the next poll
+  // Do NOT call g_http.end() - keep the socket alive for the next poll
 
   // ---- Parse JSON ---------------------------------------------------------
   // Response: { "meta": {...}, "data": [ { "subsystem": "wan", "rx_bytes-r": N, ... }, ... ] }
@@ -811,7 +806,7 @@ bool fetchTrafficStats() {
     if (name && strcmp(name, "wan") == 0) {
       wanDown = isWanSubsysDown(subsys);
 
-      // bytes per second → Mbps  (×8 / 1 000 000)
+      // bytes per second -> Mbps  (x8 / 1 000 000)
       float rxRate = subsys["rx_bytes-r"] | 0.0f;
       float txRate = subsys["tx_bytes-r"] | 0.0f;
 
@@ -852,7 +847,7 @@ bool fetchTrafficStats() {
   return true;
 }
 
-bool fetchJsonPayload(const String& url, String& payload, int& httpCode) {
+bool fetchJsonPayload(const String& url, String& payload, int& httpCode, int timeoutMs) {
   if (!g_httpInitialised) initHttpClient();
 
   if (!g_http.begin(g_secureClient, url)) {
@@ -865,7 +860,7 @@ bool fetchJsonPayload(const String& url, String& payload, int& httpCode) {
 
   g_http.addHeader("X-API-KEY", UNIFI_API_KEY);
   g_http.addHeader("Accept", "application/json");
-  g_http.setTimeout(8000);
+  g_http.setTimeout(timeoutMs);
 
   httpCode = g_http.GET();
   if (httpCode == 200) {
@@ -1016,7 +1011,7 @@ bool parsePercentValue(JsonVariantConst value, float& pct) {
 
   if (value.is<float>() || value.is<double>() || value.is<int>() || value.is<long>()) {
     double v = value.as<double>();
-    if (v >= 0.0 && v <= 1.0) v *= 100.0;  // ratio → percent
+    if (v >= 0.0 && v <= 1.0) v *= 100.0;  // ratio -> percent
     if (v < 0.0 || v > 100.0) return false;
     pct = (float)v;
     return true;
@@ -1201,7 +1196,7 @@ bool parseNumericValue(JsonVariantConst value, float& parsed) {
     s.replace("%", "");
     s.replace("C", "");
     s.replace("c", "");
-    s.replace("°", "");
+    s.replace("deg", "");
     if (s.length() == 0) return false;
 
     char* endPtr = nullptr;
@@ -1337,45 +1332,37 @@ void scanSystemMetrics(JsonVariantConst node, bool& gotCpu, bool& gotMem, bool& 
 bool fetchControllerResourceStats(float& cpuPct, float& memPct, float& tempC) {
   cpuPct = -1.0f;
   memPct = -1.0f;
-  tempC = -1.0f;
+  tempC  = -1.0f;
 
+  // Only ONE endpoint is tried per call - g_ucgEndpointIdx rotates on each
+  // invocation so all three are covered over successive 10-second windows
+  // without ever blocking more than one HTTPS request per poll cycle.
   String base = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT;
-  String endpoint1 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo";
-  String endpoint2 = base + "/api/system";
-  String endpoint3 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/device";
-  const String endpoints[3] = {endpoint1, endpoint2, endpoint3};
+  const String endpoints[3] = {
+    base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo",
+    base + "/api/system",
+    base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/device"
+  };
 
-  bool anySuccess = false;
+  String url = endpoints[g_ucgEndpointIdx];
+  g_ucgEndpointIdx = (g_ucgEndpointIdx + 1) % 3;
 
-  for (int i = 0; i < 3; i++) {
-    // Stop early only when all three metrics have been found
-    if (cpuPct >= 0.0f && memPct >= 0.0f && tempC >= 0.0f) break;
+  String payload;
+  int httpCode = 0;
+  // 3 s timeout - keeps one blocking request well under one poll cycle
+  bool ok = fetchJsonPayload(url, payload, httpCode, 3000);
+  if (!ok) return false;
 
-    String payload;
-    int httpCode = 0;
-    bool ok = fetchJsonPayload(endpoints[i], payload, httpCode);
-    if (!ok) continue;
+  DynamicJsonDocument doc(24576);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) return false;
 
-    DynamicJsonDocument doc(24576);
-    DeserializationError err = deserializeJson(doc, payload);
-    if (err) continue;
+  bool gotCpu  = false;
+  bool gotMem  = false;
+  bool gotTemp = false;
+  scanSystemMetrics(doc.as<JsonVariantConst>(), gotCpu, gotMem, gotTemp, cpuPct, memPct, tempC);
 
-    bool gotCpu  = (cpuPct  >= 0.0f);  // already satisfied – don't overwrite
-    bool gotMem  = (memPct  >= 0.0f);
-    bool gotTemp = (tempC   >= 0.0f);
-    float foundCpu  = cpuPct;
-    float foundMem  = memPct;
-    float foundTemp = tempC;
-    scanSystemMetrics(doc.as<JsonVariantConst>(), gotCpu, gotMem, gotTemp, foundCpu, foundMem, foundTemp);
-
-    if (gotCpu  && cpuPct  < 0.0f) cpuPct  = foundCpu;
-    if (gotMem  && memPct  < 0.0f) memPct  = foundMem;
-    if (gotTemp && tempC   < 0.0f) tempC   = foundTemp;
-
-    if (gotCpu || gotMem || gotTemp) anySuccess = true;
-  }
-
-  return anySuccess;
+  return gotCpu || gotMem || gotTemp;
 }
 
 float cToF(float c) {
@@ -1563,7 +1550,7 @@ void drawDisplay() {
 
   bool showBootIpOverlay = ((long)(g_bootIpOverlayUntilMs - millis()) > 0);
 
-  // ── Status (bottom-left, only on error) ──────────────────────────────────
+  // -- Status (bottom-left, only on error) ----------------------------------
   if (!showBootIpOverlay && g_statusMsg != "OK") {
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, g_statusMsg.c_str());
@@ -1601,7 +1588,7 @@ void drawError(const String& line1, const String& line2) {
 
   u8g2.setFont(u8g2_font_6x10_tf);
 
-  // Line 1 – centered vertically, slightly above middle
+  // Line 1 - centered vertically, slightly above middle
   int l1W = u8g2.getStrWidth(line1.c_str());
   u8g2.drawStr((128 - l1W) / 2, line2.isEmpty() ? 35 : 27, line1.c_str());
 
