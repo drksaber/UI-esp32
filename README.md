@@ -125,10 +125,6 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 // Check for UniFi OS / Network updates every 30 minutes
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
 
-// Graph scaling / rate formatting (applies to both IN and OUT)
-// With POLL_INTERVAL_MS = 1000, this is effectively a seconds window.
-#define GRAPH_SCALE_WINDOW_SAMPLES  24
-
 // Status LED (uses LED_BUILTIN by default)
 #define STATUS_LED_ENABLED       1
 

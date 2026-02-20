@@ -81,6 +81,19 @@ static float  g_ucgTempC       = -1.0f;
 static unsigned long g_lastEspStatsUpdateMs = 0;
 static unsigned long g_lastUcgStatsUpdateMs = 0;
 
+// ---------------------------------------------------------------------------
+// FreeRTOS synchronisation (dual-core operation)
+// ---------------------------------------------------------------------------
+// g_dataMutex    - protects shared state written by Core 0 networkTask and
+//                  read by Core 1 loop / drawDisplay / handleWebStats.
+// g_lastFetchOk  - volatile; Core 1 reads the latest value without needing
+//                  the mutex just to decide LED mode.
+// g_networkReady - set by networkTask after the first poll attempt completes
+//                  so Core 1 keeps LED_MODE_WORKING until there is real data.
+static SemaphoreHandle_t g_dataMutex   = NULL;
+static volatile bool     g_lastFetchOk  = true;
+static volatile bool     g_networkReady = false;
+
 enum LedMode {
   LED_MODE_WORKING,
   LED_MODE_WAN_DOWN,
@@ -111,8 +124,6 @@ static const unsigned long kLedWorkingBlinkMs = 250UL;
 static const unsigned long kLedWanDownBlinkMs = 70UL;
 static const unsigned long kLedOkHeartbeatMs = 30000UL;
 static const unsigned long kLedOkPulseMs = 120UL;
-static constexpr float kGraphScaleDecayFactor = 0.90f;
-static constexpr float kGraphMinScaleMbps = 0.1f;   // 100 Kbps floor - prevents scale from collapsing to near-zero
 static constexpr float kRateBpsThresholdMbps = 0.001f;
 static int g_ucgEndpointIdx = 0;  // rotates across resource-stats endpoints, one per cycle
 
@@ -161,6 +172,7 @@ void  initBootButton();
 void  updateBootButton();
 void  drawDisplay();
 void  drawError(const String& line1, const String& line2 = "");
+void  networkTask(void* pvParameters);
 
 // ===========================================================================
 // setup()
@@ -190,104 +202,174 @@ void setup() {
     while (true) delay(1000); // halt
   }
 
-  // --- Persistent TLS client -----------------------------------------------
-  initHttpClient();
+  // --- Web server (runs on Core 1 alongside the display) ------------------
   initWebServer();
 
+  // --- FreeRTOS: shared data mutex -----------------------------------------
+  g_dataMutex = xSemaphoreCreateMutex();
+
+  // --- Spawn network task pinned to Core 0 ---------------------------------
+  // loop() runs on Core 1; all HTTPS polling runs on Core 0 where the WiFi
+  // stack lives.  Blocking HTTP calls no longer stall the display or web
+  // server, and the TLS client is touched by only one core.
+  xTaskCreatePinnedToCore(
+    networkTask,    // task function
+    "networkTask",  // debug name
+    16384,          // stack bytes (TLS + ArduinoJson need headroom)
+    NULL,           // parameter (unused)
+    1,              // priority (same as loop)
+    NULL,           // task handle (not needed)
+    0               // Core 0
+  );
+  Serial.println("[setup] network task started on Core 0");
   Serial.println("[setup] ready.");
 }
 
 // ===========================================================================
-// loop()
+// loop()  -  Core 1: display, web server, LED, BOOT button
 // ===========================================================================
+// All HTTPS polling has moved to networkTask() on Core 0.  This function now
+// only handles time-sensitive UI work that must never be blocked by network I/O.
 void loop() {
+  // Guard until setup() has finished initialising the mutex and spawning the
+  // network task - prevents races during the very first few milliseconds.
+  if (g_dataMutex == NULL) { delay(10); return; }
+
   ledUpdate();
   updateBootButton();
   g_web.handleClient();
 
-  // Reconnect WiFi if lost
-  if (WiFi.status() != WL_CONNECTED) {
-    ledSetMode(LED_MODE_WORKING);
-    closeConnection();
-    g_statusMsg = "WiFi lost...";
-    drawDisplay();
-    if (wifiConnect()) {
-      initHttpClient();
-    } else {
+  // Reflect the latest network task result in the status LED.
+  // g_networkReady and g_lastFetchOk are volatile so no mutex needed here.
+  if (g_networkReady) {
+    bool wanDown = false;
+    xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+    wanDown = g_wanDown;
+    xSemaphoreGive(g_dataMutex);
+
+    if (!g_lastFetchOk) {
       ledSetMode(LED_MODE_ERROR);
+    } else if (wanDown) {
+      ledSetMode(LED_MODE_WAN_DOWN);
+    } else {
+      ledSetMode(LED_MODE_OK);
     }
-    return;
   }
 
-  // Poll on interval
-  if (millis() - g_lastPoll >= POLL_INTERVAL_MS) {
-    unsigned long pollStart = millis();
-    g_lastPoll = millis();
+  drawDisplay();
+  delay(200);  // ~5 fps display refresh; yields CPU to network task and web server
+}
 
-    if (!fetchTrafficStats()) {
-      ledSetMode(LED_MODE_ERROR);
-      g_fetchErrors++;
-      if (g_fetchErrors >= MAX_FETCH_ERRORS) {
-        // Persistent failure - tear down TLS and rebuild on next poll
-        closeConnection();
+// ===========================================================================
+// networkTask()  -  Core 0: all HTTPS polling
+// ===========================================================================
+// Pinned to Core 0 where the WiFi/BT stack lives.  Blocking TLS calls here
+// never stall the Core 1 display or web server.
+void networkTask(void* pvParameters) {
+  // Initialise the persistent TLS client on this core.
+  initHttpClient();
+
+  // Task-local timing (not shared - no mutex needed).
+  unsigned long lastPoll               = 0;
+  unsigned long lastUpdateCheck        = 0;
+  unsigned long lastControllerStatsPoll = 0;
+
+  for (;;) {
+    // ---- WiFi watchdog --------------------------------------------------
+    if (WiFi.status() != WL_CONNECTED) {
+      xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+      g_statusMsg = "WiFi lost...";
+      xSemaphoreGive(g_dataMutex);
+
+      g_lastFetchOk  = false;
+      g_networkReady = true;  // let Core 1 show the error state
+      closeConnection();
+
+      ledSetMode(LED_MODE_WORKING);
+      if (wifiConnect()) {
         initHttpClient();
+      } else {
+        xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+        g_statusMsg = "WiFi failed";
+        xSemaphoreGive(g_dataMutex);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+      }
+      continue;
+    }
+
+    unsigned long now = millis();
+
+    // ---- Traffic stats poll (every POLL_INTERVAL_MS) --------------------
+    if (now - lastPoll >= POLL_INTERVAL_MS) {
+      unsigned long pollStart = now;
+      lastPoll = now;
+
+      bool ok = fetchTrafficStats();  // writes shared state under mutex
+      g_lastFetchOk = ok;             // volatile write
+
+      if (!ok) {
+        xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+        g_fetchErrors++;
+        int errs = g_fetchErrors;
+        xSemaphoreGive(g_dataMutex);
+        if (errs >= MAX_FETCH_ERRORS) {
+          closeConnection();
+          initHttpClient();
+          xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+          g_fetchErrors = 0;
+          xSemaphoreGive(g_dataMutex);
+        }
+      } else {
+        xSemaphoreTake(g_dataMutex, portMAX_DELAY);
         g_fetchErrors = 0;
+        xSemaphoreGive(g_dataMutex);
       }
-    } else {
-      g_fetchErrors = 0;
-      if (g_wanDown) {
-        ledSetMode(LED_MODE_WAN_DOWN);
-      } else {
-        ledSetMode(LED_MODE_OK);
+
+      // ---- Firmware update check (piggybacked on the poll cycle) --------
+      if (lastUpdateCheck == 0 || (millis() - lastUpdateCheck >= UPDATE_CHECK_INTERVAL_MS)) {
+        bool updateAvailable = false;
+        bool checkOk = fetchUpdateAvailability(updateAvailable);
+        if (checkOk) {
+          xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+          g_updateAvailable = updateAvailable;
+          xSemaphoreGive(g_dataMutex);
+          Serial.printf("[Update] available=%s\n", updateAvailable ? "yes" : "no");
+        } else {
+          Serial.println("[Update] check failed; keeping previous state");
+        }
+        lastUpdateCheck = millis();
       }
+
+      // ---- Controller resource stats (every kControllerStatsPollMs) -----
+      if (lastControllerStatsPoll == 0 || (millis() - lastControllerStatsPoll >= kControllerStatsPollMs)) {
+        float cpuPct = -1.0f, memPct = -1.0f, tempC = -1.0f;
+        if (fetchControllerResourceStats(cpuPct, memPct, tempC)) {
+          xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+          bool updatedAny = false;
+          if (cpuPct >= 0.0f && cpuPct <= 100.0f) { g_ucgCpuUtilPct = cpuPct; updatedAny = true; }
+          if (memPct >= 0.0f && memPct <= 100.0f) { g_ucgMemUtilPct = memPct; updatedAny = true; }
+          if (tempC  >= 0.0f && tempC  <= 150.0f) { g_ucgTempC  = tempC;  updatedAny = true; }
+          if (updatedAny) g_lastUcgStatsUpdateMs = millis();
+          xSemaphoreGive(g_dataMutex);
+        }
+        lastControllerStatsPoll = millis();
+      }
+
+      // ---- ESP telemetry ------------------------------------------------
+      float espTemp = temperatureRead();
+      unsigned long pollElapsed = millis() - pollStart;
+      float workPct = min(100.0f, (100.0f * (float)pollElapsed) / (float)POLL_INTERVAL_MS);
+      xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+      g_espTempC             = espTemp;
+      g_lastPollWorkPct      = workPct;
+      g_espCpuUtilPct        = workPct;
+      g_lastEspStatsUpdateMs = millis();
+      xSemaphoreGive(g_dataMutex);
+
+      g_networkReady = true;  // at least one poll attempt has completed
     }
 
-    if (g_lastUpdateCheck == 0 || (millis() - g_lastUpdateCheck >= UPDATE_CHECK_INTERVAL_MS)) {
-      bool updateAvailable = false;
-      bool checkOk = fetchUpdateAvailability(updateAvailable);
-      if (checkOk) {
-        g_updateAvailable = updateAvailable;
-        Serial.printf("[Update] available=%s\n", g_updateAvailable ? "yes" : "no");
-      } else {
-        Serial.println("[Update] check failed; keeping previous state");
-      }
-      g_lastUpdateCheck = millis();
-    }
-
-    if (g_lastControllerStatsPoll == 0 || (millis() - g_lastControllerStatsPoll >= kControllerStatsPollMs)) {
-      float cpuPct = -1.0f;
-      float memPct = -1.0f;
-      float tempC = -1.0f;
-      if (fetchControllerResourceStats(cpuPct, memPct, tempC)) {
-        bool updatedAny = false;
-        if (cpuPct >= 0.0f && cpuPct <= 100.0f) {
-          g_ucgCpuUtilPct = cpuPct;
-          updatedAny = true;
-        }
-        if (memPct >= 0.0f && memPct <= 100.0f) {
-          g_ucgMemUtilPct = memPct;
-          updatedAny = true;
-        }
-        if (tempC >= 0.0f && tempC <= 150.0f) {
-          g_ucgTempC = tempC;
-          updatedAny = true;
-        }
-        if (updatedAny) {
-          g_lastUcgStatsUpdateMs = millis();
-        }
-      }
-      g_lastControllerStatsPoll = millis();
-    }
-
-    g_espTempC = temperatureRead();
-    unsigned long pollElapsed = millis() - pollStart;
-    float workPct = (100.0f * (float)pollElapsed) / (float)POLL_INTERVAL_MS;
-    if (workPct > 100.0f) workPct = 100.0f;
-    g_lastPollWorkPct = workPct;
-    g_espCpuUtilPct = g_lastPollWorkPct;
-    g_lastEspStatsUpdateMs = millis();
-
-    drawDisplay();
+    vTaskDelay(pdMS_TO_TICKS(10));  // yield; prevents WDT trigger
   }
 }
 
@@ -653,35 +735,40 @@ void appendHistory(JsonArray arr, float* history, int points) {
 void handleWebStats() {
   if (!webCheckAuth()) return;
   DynamicJsonDocument doc(16384);
-  doc["in_mbps"] = g_inMbps;
-  doc["out_mbps"] = g_outMbps;
-  doc["clients"] = g_clients;
-  doc["wan_uptime_pct"] = g_wanUptimePct;
-  doc["wan_latency_ms"] = g_wanLatencyMs;
-  doc["wan_down"] = g_wanDown;
+
+  // Snapshot all shared state under mutex; serialization happens after release.
+  xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+  doc["in_mbps"]          = g_inMbps;
+  doc["out_mbps"]         = g_outMbps;
+  doc["clients"]          = g_clients;
+  doc["wan_uptime_pct"]   = g_wanUptimePct;
+  doc["wan_latency_ms"]   = g_wanLatencyMs;
+  doc["wan_down"]         = g_wanDown;
   doc["update_available"] = g_updateAvailable;
-  doc["status"] = g_statusMsg;
-  doc["fetch_errors"] = g_fetchErrors;
-  doc["wifi_rssi"] = WiFi.RSSI();
-  doc["ip"] = WiFi.localIP().toString();
-  doc["heap_free"] = ESP.getFreeHeap();
-  doc["uptime_s"] = millis() / 1000UL;
+  doc["status"]           = g_statusMsg;
+  doc["fetch_errors"]     = g_fetchErrors;
+  doc["wifi_rssi"]        = WiFi.RSSI();
+  doc["ip"]               = WiFi.localIP().toString();
+  doc["heap_free"]        = ESP.getFreeHeap();
+  doc["uptime_s"]         = millis() / 1000UL;
   doc["esp_cpu_util_pct"] = g_espCpuUtilPct;
-  doc["esp_temp_f"] = (g_espTempC < 0.0f) ? -1.0f : cToF(g_espTempC);
+  doc["esp_temp_f"]       = (g_espTempC < 0.0f) ? -1.0f : cToF(g_espTempC);
   doc["ucg_cpu_util_pct"] = g_ucgCpuUtilPct;
   doc["ucg_mem_util_pct"] = g_ucgMemUtilPct;
-  doc["ucg_temp_f"] = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
+  doc["ucg_temp_f"]       = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
 
   long espAgeMs = (g_lastEspStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastEspStatsUpdateMs);
   long ucgAgeMs = (g_lastUcgStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastUcgStatsUpdateMs);
-  doc["esp_stats_age_s"] = (espAgeMs < 0) ? -1.0f : (float)espAgeMs / 1000.0f;
-  doc["ucg_stats_age_s"] = (ucgAgeMs < 0) ? -1.0f : (float)ucgAgeMs / 1000.0f;
+  doc["esp_stats_age_s"]  = (espAgeMs < 0) ? -1.0f : (float)espAgeMs / 1000.0f;
+  doc["ucg_stats_age_s"]  = (ucgAgeMs < 0) ? -1.0f : (float)ucgAgeMs / 1000.0f;
 
-  JsonArray inHist = doc.createNestedArray("in_history");
+  JsonArray inHist  = doc.createNestedArray("in_history");
   JsonArray outHist = doc.createNestedArray("out_history");
-  appendHistory(inHist, g_inHistory, WEB_HISTORY_POINTS);
+  appendHistory(inHist,  g_inHistory,  WEB_HISTORY_POINTS);
   appendHistory(outHist, g_outHistory, WEB_HISTORY_POINTS);
+  xSemaphoreGive(g_dataMutex);
 
+  // Serialize and send outside the mutex - no shared state access here.
   String payload;
   serializeJson(doc, payload);
   webSendSecurityHeaders();
@@ -702,7 +789,15 @@ void handleWebStats() {
  *   "rx_bytes-r"  - bytes/sec received  (inbound  / download)
  *   "tx_bytes-r"  - bytes/sec sent      (outbound / upload)
  */
+// Helper used only by fetchTrafficStats to write a status string under mutex.
+static void _setStatus(const char* msg) {
+  xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+  g_statusMsg = msg;
+  xSemaphoreGive(g_dataMutex);
+}
+
 bool fetchTrafficStats() {
+  // NOTE: must only be called from networkTask (Core 0); not re-entrant.
   if (!g_httpInitialised) initHttpClient();
 
   String url = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT
@@ -713,6 +808,7 @@ bool fetchTrafficStats() {
     Serial.println("[UniFi] http.begin failed - reconnecting");
     closeConnection();
     initHttpClient();
+    _setStatus("Conn error");
     return false;
   }
 
@@ -725,20 +821,20 @@ bool fetchTrafficStats() {
 
   if (httpCode == 401 || httpCode == 403) {
     Serial.println("[UniFi] API key rejected - check UNIFI_API_KEY in config.h");
-    g_statusMsg = "Bad API key";
+    _setStatus("Bad API key");
     return false;
   }
 
   if (httpCode <= 0) {
     Serial.printf("[UniFi] connection error %d, rebuilding TLS\n", httpCode);
-    g_statusMsg = "Conn error";
     closeConnection();
     initHttpClient();
+    _setStatus("Conn error");
     return false;
   }
 
   if (httpCode != 200) {
-    g_statusMsg = "API err " + String(httpCode);
+    _setStatus(("API err " + String(httpCode)).c_str());
     return false;
   }
 
@@ -751,24 +847,27 @@ bool fetchTrafficStats() {
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     Serial.printf("[JSON] parse error: %s\n", err.c_str());
-    g_statusMsg = "JSON error";
+    _setStatus("JSON error");
     return false;
   }
 
   JsonArray dataArr = doc["data"].as<JsonArray>();
   if (dataArr.isNull()) {
     Serial.println("[JSON] 'data' array missing");
-    g_statusMsg = "No data";
+    _setStatus("No data");
     return false;
   }
 
+  // ---- Parse into local variables (no shared state touched yet) -----------
   bool foundWan = false;
   bool wanDown = false;
   int wlanClients = -1;
   int lanClients  = -1;
   int fallbackClients = -1;
-  float discoveredWanUptime = -1.0f;
+  float discoveredWanUptime  = -1.0f;
   float discoveredWanLatency = -1.0f;
+  float localInMbps  = 0.0f;
+  float localOutMbps = 0.0f;
 
   for (JsonObject subsys : dataArr) {
     const char* name = subsys["subsystem"];
@@ -809,40 +908,44 @@ bool fetchTrafficStats() {
       // bytes per second -> Mbps  (x8 / 1 000 000)
       float rxRate = subsys["rx_bytes-r"] | 0.0f;
       float txRate = subsys["tx_bytes-r"] | 0.0f;
+      localInMbps  = rxRate * 8.0f / 1000000.0f;
+      localOutMbps = txRate * 8.0f / 1000000.0f;
 
-      g_inMbps  = rxRate * 8.0f / 1000000.0f;
-      g_outMbps = txRate * 8.0f / 1000000.0f;
-
-      // Push into waveform ring buffers
-      g_inHistory[g_histIdx]  = g_inMbps;
-      g_outHistory[g_histIdx] = g_outMbps;
-      g_histIdx = (g_histIdx + 1) % GRAPH_SAMPLES;
-
-      Serial.printf("[Stats] IN=%.2f Mbps  OUT=%.2f Mbps\n", g_inMbps, g_outMbps);
-
-      g_statusMsg = "OK";
+      Serial.printf("[Stats] IN=%.2f Mbps  OUT=%.2f Mbps\n", localInMbps, localOutMbps);
       foundWan = true;
     }
   }
 
-  g_wanUptimePct = discoveredWanUptime;
-  g_wanLatencyMs = discoveredWanLatency;
-  g_wanDown = wanDown;
-
-  if (wlanClients >= 0 || lanClients >= 0) {
-    int total = 0;
-    if (wlanClients >= 0) total += wlanClients;
-    if (lanClients >= 0)  total += lanClients;
-    g_clients = total;
-  } else if (fallbackClients >= 0) {
-    g_clients = fallbackClients;
-  }
-
   if (!foundWan) {
     Serial.println("[Stats] WAN subsystem not found");
-    g_statusMsg = "No WAN data";
+    _setStatus("No WAN data");
     return false;
   }
+
+  // ---- Compute client count (still local) ---------------------------------
+  int newClients = -1;
+  if (wlanClients >= 0 || lanClients >= 0) {
+    newClients = 0;
+    if (wlanClients >= 0) newClients += wlanClients;
+    if (lanClients  >= 0) newClients += lanClients;
+  } else if (fallbackClients >= 0) {
+    newClients = fallbackClients;
+  }
+
+  // ---- Commit all parsed values to shared state under mutex ---------------
+  // The mutex is held only for this brief write block, NOT during the HTTP call.
+  xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+  g_inMbps                  = localInMbps;
+  g_outMbps                 = localOutMbps;
+  g_inHistory[g_histIdx]    = localInMbps;
+  g_outHistory[g_histIdx]   = localOutMbps;
+  g_histIdx                 = (g_histIdx + 1) % GRAPH_SAMPLES;
+  g_wanUptimePct            = discoveredWanUptime;
+  g_wanLatencyMs            = discoveredWanLatency;
+  g_wanDown                 = wanDown;
+  if (newClients >= 0) g_clients = newClients;
+  g_statusMsg               = "OK";
+  xSemaphoreGive(g_dataMutex);
 
   return true;
 }
@@ -1447,6 +1550,12 @@ void drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int 
 void drawDisplay() {
   char bufIn[16], bufOut[16], clientBuf[20], uptimeBuf[12], latencyBuf[12];
   char inLine[24], outLine[24];
+
+  // Hold the mutex while reading shared globals and filling the u8g2 frame
+  // buffer.  The mutex is released BEFORE sendBuffer() so the slow I2C
+  // transfer does not block the network task from writing new data.
+  xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+
   formatRate(g_inMbps,  bufIn,  sizeof(bufIn));
   formatRate(g_outMbps, bufOut, sizeof(bufOut));
 
@@ -1462,26 +1571,14 @@ void drawDisplay() {
   u8g2.drawHLine(1, 11, splitX - 1);
   u8g2.drawHLine(1, 37, splitX - 1);
 
-  // Real traffic graphs per IN/OUT box, each with independent scale.
-  // Use a recent window so old spikes don't keep low traffic flattened.
-  float inPeakRaw  = historyPeakRecent(g_inHistory, GRAPH_SCALE_WINDOW_SAMPLES);
-  float outPeakRaw = historyPeakRecent(g_outHistory, GRAPH_SCALE_WINDOW_SAMPLES);
-
-  if (inPeakRaw > g_inGraphScale) {
-    g_inGraphScale = inPeakRaw;
-  } else {
-    g_inGraphScale *= kGraphScaleDecayFactor;
-    if (g_inGraphScale < inPeakRaw) g_inGraphScale = inPeakRaw;
-    if (g_inGraphScale < kGraphMinScaleMbps) g_inGraphScale = kGraphMinScaleMbps;
-  }
-
-  if (outPeakRaw > g_outGraphScale) {
-    g_outGraphScale = outPeakRaw;
-  } else {
-    g_outGraphScale *= kGraphScaleDecayFactor;
-    if (g_outGraphScale < outPeakRaw) g_outGraphScale = outPeakRaw;
-    if (g_outGraphScale < kGraphMinScaleMbps) g_outGraphScale = kGraphMinScaleMbps;
-  }
+  // Independent scale for each graph: peak over the entire ring buffer,
+  // floored at 0.1 Mbps.  Scanning all GRAPH_SAMPLES (>= pixels drawn)
+  // guarantees no visible sample overflows the scale.  Mirrors the web
+  // graph which runs Math.max(0.1, ...all_data).
+  float inPeakRaw  = historyPeakRecent(g_inHistory, GRAPH_SAMPLES);
+  float outPeakRaw = historyPeakRecent(g_outHistory, GRAPH_SAMPLES);
+  g_inGraphScale  = max(0.1f, inPeakRaw);
+  g_outGraphScale = max(0.1f, outPeakRaw);
 
   drawTrafficGraphInBox(g_inHistory,  leftInnerL, leftInnerR, 12, 36, g_inGraphScale);
   drawTrafficGraphInBox(g_outHistory, leftInnerL, leftInnerR, 38, 62, g_outGraphScale);
@@ -1577,6 +1674,9 @@ void drawDisplay() {
     u8g2.drawStr(boxX + (boxW - ipW) / 2, boxY + 18, g_bootIpOverlayMsg.c_str());
   }
 
+  // Release mutex before the I2C transfer so the network task is not blocked
+  // by the ~5-10 ms it takes to clock out a full SH1106 frame buffer.
+  xSemaphoreGive(g_dataMutex);
   u8g2.sendBuffer();
 }
 

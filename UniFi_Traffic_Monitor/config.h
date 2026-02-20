@@ -47,13 +47,6 @@
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
 
 // =============================================================
-//  Graph Scaling / Rate Formatting
-// =============================================================
-// Recent-sample window used for IN/OUT autoscaling.
-// With POLL_INTERVAL_MS = 1000, this is effectively a seconds window.
-#define GRAPH_SCALE_WINDOW_SAMPLES  24
-
-// =============================================================
 //  Status LED
 // =============================================================
 // Set to 0 to disable all status LED behavior
