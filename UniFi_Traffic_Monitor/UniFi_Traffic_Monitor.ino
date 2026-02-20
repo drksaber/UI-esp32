@@ -90,9 +90,12 @@ static unsigned long g_lastUcgStatsUpdateMs = 0;
 //                  the mutex just to decide LED mode.
 // g_networkReady - set by networkTask after the first poll attempt completes
 //                  so Core 1 keeps LED_MODE_WORKING until there is real data.
-static SemaphoreHandle_t g_dataMutex   = NULL;
-static volatile bool     g_lastFetchOk  = true;
-static volatile bool     g_networkReady = false;
+// g_dataVersion  - incremented by networkTask each time new traffic data is
+//                  committed; Core 1 uses it to skip redundant redraws.
+static SemaphoreHandle_t     g_dataMutex   = NULL;
+static volatile bool         g_lastFetchOk  = true;
+static volatile bool         g_networkReady = false;
+static volatile uint32_t     g_dataVersion  = 0;
 
 enum LedMode {
   LED_MODE_WORKING,
@@ -256,8 +259,18 @@ void loop() {
     }
   }
 
-  drawDisplay();
-  delay(200);  // ~5 fps display refresh; yields CPU to network task and web server
+  // Only redraw when networkTask has committed new data (version advanced) or
+  // the boot IP overlay popup is active (it uses millis() expiry).
+  // This prevents 4 of every 5 frames being a redundant clear+redraw+I2C blast
+  // at 200 ms poll rate vs 1000 ms data rate, which caused visible choppiness.
+  static uint32_t lastDrawnVersion = 0;
+  bool overlayActive = ((long)(g_bootIpOverlayUntilMs - millis()) > 0);
+  if (g_dataVersion != lastDrawnVersion || overlayActive) {
+    lastDrawnVersion = g_dataVersion;
+    drawDisplay();
+  }
+
+  delay(20);  // 50Hz button/LED polling; display only redraws on new data or overlay
 }
 
 // ===========================================================================
@@ -556,7 +569,7 @@ void updateBootButton() {
     g_bootIpOverlayMsg = "IP: " + WiFi.localIP().toString();
     g_bootIpOverlayUntilMs = now + kBootButtonIpShowMs;
     Serial.printf("[BOOT] short press -> show IP: %s\n", g_bootIpOverlayMsg.c_str());
-    drawDisplay();
+    // loop() will pick up overlayActive on the very next 20ms tick and redraw.
     return;
   }
 }
@@ -945,6 +958,7 @@ bool fetchTrafficStats() {
   g_wanDown                 = wanDown;
   if (newClients >= 0) g_clients = newClients;
   g_statusMsg               = "OK";
+  g_dataVersion++;  // signals Core 1 that a new frame is ready to draw
   xSemaphoreGive(g_dataMutex);
 
   return true;
