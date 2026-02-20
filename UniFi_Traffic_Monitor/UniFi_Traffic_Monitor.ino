@@ -2,16 +2,16 @@
  * UniFi_Traffic_Monitor.ino
  *
  * Displays real-time internet traffic (IN / OUT Mbps) from a Ubiquiti UCG-MAX
- * on a 128x64 SH1106 OLED over I2C.
+ * on a 128x64 SH1106 OLED over I2C, with a built-in web dashboard.
  *
  * Target hardware : ESP32 (any variant)
  * Display         : SH1106 128x64 I2C (0x3C)
  * Controller      : Ubiquiti UCG-MAX (UniFi OS 5.x / Network 10.x)
  *
  * Required libraries (install via Arduino Library Manager):
- *   - U8g2            by oliver  (display driver)
- *   - ArduinoJson     by bblanchon (JSON parsing)
- *   - WiFiClientSecure & HTTPClient - bundled with ESP32 board package
+ *   - U8g2            by oliver       (display driver)
+ *   - ArduinoJson     by bblanchon    (JSON parsing)
+ *   - WiFiClientSecure & HTTPClient   (bundled with ESP32 board package)
  *
  * Configuration: edit config.h
  *
@@ -26,6 +26,11 @@
  *   saving ~200-300 ms per poll and allowing a stable 1 s refresh rate.
  *   The connection is re-established automatically after any failure or
  *   after a WiFi drop.
+ *
+ * Dual-core operation:
+ *   Core 0 (networkTask) - all HTTPS polling; never blocks Core 1.
+ *   Core 1 (loop)        - OLED display, web server, LED, BOOT button.
+ *   Shared state is protected by g_dataMutex (FreeRTOS mutex).
  */
 
 #include <WiFi.h>
@@ -67,10 +72,6 @@ static float  g_wanLatencyMs   = -1.0f;
 static bool   g_wanDown        = false;
 static bool   g_updateAvailable = false;
 static String g_statusMsg      = "Connecting...";
-static unsigned long g_lastPoll = 0;
-static unsigned long g_lastUpdateCheck = 0;
-static unsigned long g_lastControllerStatsPoll = 0;
-static float  g_lastPollWorkPct = -1.0f;
 static float  g_inGraphScale   = 0.1f;
 static float  g_outGraphScale  = 0.1f;
 static float  g_espCpuUtilPct  = -1.0f;
@@ -78,6 +79,7 @@ static float  g_espTempC       = -1.0f;
 static float  g_ucgCpuUtilPct  = -1.0f;
 static float  g_ucgMemUtilPct  = -1.0f;
 static float  g_ucgTempC       = -1.0f;
+static float  g_monthlyUsageGB = -1.0f;
 static unsigned long g_lastEspStatsUpdateMs = 0;
 static unsigned long g_lastUcgStatsUpdateMs = 0;
 
@@ -115,12 +117,14 @@ static bool g_bootStablePressed = false;
 static unsigned long g_bootLastRawChangeMs = 0;
 static unsigned long g_bootIpOverlayUntilMs = 0;
 static String g_bootIpOverlayMsg = "";
+static volatile unsigned long g_wanDownSinceMs = 0;  // millis() when WAN went down, 0 if up
 
 static const int kBootButtonPin = 0;
 static const bool kBootButtonActiveLow = true;
 static const unsigned long kBootButtonDebounceMs = 30UL;
 static const unsigned long kBootButtonIpShowMs = 5000UL;
-static const unsigned long kControllerStatsPollMs = 10000UL;
+static const unsigned long kControllerStatsPollMs  = 10000UL;
+static const unsigned long kMonthlyUsagePollMs     = 300000UL; // 5 min
 static const int kStatusLedPin = LED_BUILTIN;
 static const bool kStatusLedActiveLow = false;
 static const unsigned long kLedWorkingBlinkMs = 250UL;
@@ -161,6 +165,7 @@ bool  parseNumericValue(JsonVariantConst value, float& parsed);
 bool  keyContainsAny(const String& key, const char* const* tokens, size_t tokenCount);
 void  scanSystemMetrics(JsonVariantConst node, bool& gotCpu, bool& gotMem, bool& gotTemp, float& cpuPct, float& memPct, float& tempC);
 bool  fetchControllerResourceStats(float& cpuPct, float& memPct, float& tempC);
+bool  fetchMonthlyUsage();
 float cToF(float c);
 void  initWebServer();
 void  handleWebRoot();
@@ -264,7 +269,7 @@ void loop() {
   // This prevents 4 of every 5 frames being a redundant clear+redraw+I2C blast
   // at 200 ms poll rate vs 1000 ms data rate, which caused visible choppiness.
   static uint32_t lastDrawnVersion = 0;
-  bool overlayActive = ((long)(g_bootIpOverlayUntilMs - millis()) > 0);
+  bool overlayActive = ((long)(g_bootIpOverlayUntilMs - millis()) > 0) || g_wanDown;
   if (g_dataVersion != lastDrawnVersion || overlayActive) {
     lastDrawnVersion = g_dataVersion;
     drawDisplay();
@@ -283,9 +288,10 @@ void networkTask(void* pvParameters) {
   initHttpClient();
 
   // Task-local timing (not shared - no mutex needed).
-  unsigned long lastPoll               = 0;
-  unsigned long lastUpdateCheck        = 0;
+  unsigned long lastPoll                = 0;
+  unsigned long lastUpdateCheck         = 0;
   unsigned long lastControllerStatsPoll = 0;
+  unsigned long lastMonthlyPoll         = 0;
 
   for (;;) {
     // ---- WiFi watchdog --------------------------------------------------
@@ -368,13 +374,18 @@ void networkTask(void* pvParameters) {
         lastControllerStatsPoll = millis();
       }
 
+      // ---- Monthly bandwidth usage (every kMonthlyUsagePollMs) -----------
+      if (lastMonthlyPoll == 0 || (millis() - lastMonthlyPoll >= kMonthlyUsagePollMs)) {
+        fetchMonthlyUsage();
+        lastMonthlyPoll = millis();
+      }
+
       // ---- ESP telemetry ------------------------------------------------
       float espTemp = temperatureRead();
       unsigned long pollElapsed = millis() - pollStart;
       float workPct = min(100.0f, (100.0f * (float)pollElapsed) / (float)POLL_INTERVAL_MS);
       xSemaphoreTake(g_dataMutex, portMAX_DELAY);
       g_espTempC             = espTemp;
-      g_lastPollWorkPct      = workPct;
       g_espCpuUtilPct        = workPct;
       g_lastEspStatsUpdateMs = millis();
       xSemaphoreGive(g_dataMutex);
@@ -620,6 +631,7 @@ void handleWebRoot() {
     <div class="card"><div class="k">Clients</div><div id="clients" class="v">--</div></div>
     <div class="card"><div class="k">WAN Uptime (24h)</div><div id="uptime" class="v">--</div></div>
     <div class="card"><div class="k">WAN Latency</div><div id="latency" class="v">--</div></div>
+    <div class="card"><div class="k">Monthly Usage</div><div id="usage" class="v">--</div></div>
     <div class="card"><div class="k">Controller Update</div><div id="update" class="v">--</div></div>
     <div class="card"><div class="k">UCG CPU</div><div id="ucgCpu" class="v">--</div></div>
     <div class="card"><div class="k">UCG Memory</div><div id="ucgMem" class="v">--</div></div>
@@ -697,9 +709,10 @@ void handleWebRoot() {
         document.getElementById('in').textContent = fmtMbps(d.in_mbps);
         document.getElementById('out').textContent = fmtMbps(d.out_mbps);
         document.getElementById('clients').textContent = d.clients >= 0 ? d.clients : '--';
-        document.getElementById('uptime').textContent = d.wan_uptime_pct >= 0 ? d.wan_uptime_pct.toFixed(1)+'%' : '--.-%';
+        document.getElementById('uptime').textContent = d.wan_uptime_pct >= 0 ? d.wan_uptime_pct.toFixed(2)+'%' : '--.--% ';
         document.getElementById('latency').textContent = d.wan_latency_ms >= 0 ? d.wan_latency_ms.toFixed(1)+' ms' : '--.- ms';
         document.getElementById('update').textContent = d.update_available ? 'UPDATE AVAILABLE' : 'Up to date';
+        document.getElementById('usage').textContent = d.monthly_usage_gb >= 0 ? d.monthly_usage_gb.toFixed(1)+' GB' : '--';
         document.getElementById('rssi').textContent = d.wifi_rssi + ' dBm';
         document.getElementById('ip').textContent = d.ip;
         document.getElementById('status').textContent = d.status;
@@ -768,7 +781,8 @@ void handleWebStats() {
   doc["esp_temp_f"]       = (g_espTempC < 0.0f) ? -1.0f : cToF(g_espTempC);
   doc["ucg_cpu_util_pct"] = g_ucgCpuUtilPct;
   doc["ucg_mem_util_pct"] = g_ucgMemUtilPct;
-  doc["ucg_temp_f"]       = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
+  doc["ucg_temp_f"]         = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
+  doc["monthly_usage_gb"]   = g_monthlyUsageGB;
 
   long espAgeMs = (g_lastEspStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastEspStatsUpdateMs);
   long ucgAgeMs = (g_lastUcgStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastUcgStatsUpdateMs);
@@ -956,9 +970,69 @@ bool fetchTrafficStats() {
   g_wanUptimePct            = discoveredWanUptime;
   g_wanLatencyMs            = discoveredWanLatency;
   g_wanDown                 = wanDown;
+  // Track WAN down onset for the OLED counter overlay
+  static bool prevCommitWanDown = false;
+  if (wanDown && !prevCommitWanDown)  g_wanDownSinceMs = millis(); // up->down: latch start time
+  else if (!wanDown)                  g_wanDownSinceMs = 0;        // up: clear
+  prevCommitWanDown = wanDown;
   if (newClients >= 0) g_clients = newClients;
-  g_statusMsg               = "OK";
+  g_statusMsg               = wanDown ? "WAN DOWN" : "OK";
   g_dataVersion++;  // signals Core 1 that a new frame is ready to draw
+  xSemaphoreGive(g_dataMutex);
+
+  return true;
+}
+
+bool fetchMonthlyUsage() {
+  // POST /proxy/network/api/s/{site}/stat/report/monthly.gw
+  // Returns monthly WAN traffic totals bucketed by month.
+  if (!g_httpInitialised) initHttpClient();
+
+  String url = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT
+             + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/report/monthly.gw";
+
+  if (!g_http.begin(g_secureClient, url)) {
+    closeConnection();
+    initHttpClient();
+    return false;
+  }
+
+  g_http.addHeader("X-API-KEY",    UNIFI_API_KEY);
+  g_http.addHeader("Accept",       "application/json");
+  g_http.addHeader("Content-Type", "application/json");
+  g_http.setTimeout(8000);
+
+  const char* body = "{\"attrs\":[\"wan-rx_bytes\",\"wan-tx_bytes\"]}";
+  int httpCode = g_http.POST(body);
+  if (httpCode != 200) {
+    Serial.printf("[Monthly] HTTP %d\n", httpCode);
+    return false;
+  }
+
+  String payload = g_http.getString();
+
+  DynamicJsonDocument doc(32768);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[Monthly] JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  JsonArray dataArr = doc["data"].as<JsonArray>();
+  if (dataArr.isNull() || dataArr.size() == 0) return false;
+
+  // Sum all entries (POST without date range returns current month buckets)
+  double rxBytes = 0, txBytes = 0;
+  for (JsonObject entry : dataArr) {
+    rxBytes += entry["wan-rx_bytes"].as<double>();
+    txBytes += entry["wan-tx_bytes"].as<double>();
+  }
+
+  float totalGB = (float)((rxBytes + txBytes) / 1.0e9);
+  Serial.printf("[Monthly] usage=%.2f GB\n", totalGB);
+
+  xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+  g_monthlyUsageGB = totalGB;
   xSemaphoreGive(g_dataMutex);
 
   return true;
@@ -1153,41 +1227,33 @@ bool parsePercentValue(JsonVariantConst value, float& pct) {
 }
 
 bool extractWanUptime24h(JsonObjectConst wanObj, float& pct) {
-  // Common direct key names seen across UniFi API versions
-  const char* directKeys[] = {
-    "uptime_24h",
-    "wan_uptime_24h",
-    "uptime24h",
-    "availability_24h",
-    "wan_availability_24h",
-    "wan_uptime",
-    "uptime",
-    "availability"
-  };
+  // UCG-MAX fw 5.x: uptime_stats.WAN.uptime / uptime_stats.WAN.time_period gives
+  // true float precision (e.g. 1088/1090 = 99.82%) matching the UCG display.
+  // The integer "availability" field is already rounded and should be skipped.
+  JsonVariantConst uptimeStats = wanObj["uptime_stats"];
+  if (!uptimeStats.isNull() && uptimeStats.is<JsonObjectConst>()) {
+    JsonVariantConst wanBlock = uptimeStats["WAN"];
+    if (!wanBlock.isNull() && wanBlock.is<JsonObjectConst>()) {
+      int uptimeSecs    = wanBlock["uptime"]     | -1;
+      int timePeriodSecs = wanBlock["time_period"] | -1;
+      if (uptimeSecs >= 0 && timePeriodSecs > 0) {
+        pct = 100.0f * (float)uptimeSecs / (float)timePeriodSecs;
+        return true;
+      }
+      // Fallback: integer availability if time fields absent
+      int avail = wanBlock["availability"] | -1;
+      if (avail >= 0 && avail <= 100) { pct = (float)avail; return true; }
+    }
+  }
 
+  // Fallback: direct keys for other UniFi hardware / firmware variants
+  const char* directKeys[] = {
+    "uptime_24h", "wan_uptime_24h", "uptime24h",
+    "availability_24h", "wan_availability_24h"
+  };
   for (size_t i = 0; i < sizeof(directKeys) / sizeof(directKeys[0]); i++) {
     JsonVariantConst v = wanObj[directKeys[i]];
     if (parsePercentValue(v, pct)) return true;
-  }
-
-  // UniFi often nests these inside uptime_stats
-  JsonVariantConst stats = wanObj["uptime_stats"];
-  if (stats.is<JsonObjectConst>()) {
-    JsonObjectConst obj = stats.as<JsonObjectConst>();
-
-    const char* statKeys[] = {"WAN", "wan", "internet", "24h", "last_24h", "24hr"};
-    for (size_t i = 0; i < sizeof(statKeys) / sizeof(statKeys[0]); i++) {
-      JsonVariantConst v = obj[statKeys[i]];
-      if (parsePercentValue(v, pct)) return true;
-    }
-
-    for (JsonPairConst kv : obj) {
-      String key = kv.key().c_str();
-      key.toLowerCase();
-      if (key.indexOf("wan") >= 0 || key.indexOf("uptime") >= 0 || key.indexOf("24") >= 0) {
-        if (parsePercentValue(kv.value(), pct)) return true;
-      }
-    }
   }
 
   return false;
@@ -1276,16 +1342,53 @@ bool extractWanLatencyMs(JsonObjectConst wanObj, float& latencyMs) {
 }
 
 bool isWanSubsysDown(JsonObjectConst wanObj) {
-  // Boolean flags commonly used by UniFi payloads
+  // UCG-MAX fw 5.x - two confirmed failure modes (status field is "ok" in all cases):
+  //
+  //  1. Port disabled (software):  uptime_stats={} WAN key absent, isp_name absent
+  //  2. ISP/modem outage:          uptime_stats.WAN.downtime present,
+  //                                all alerting_monitors[*].availability==0,
+  //                                isp_name still present (physical link to router intact)
+
+  JsonVariantConst uptimeStats = wanObj["uptime_stats"];
+  if (!uptimeStats.isNull() && uptimeStats.is<JsonObjectConst>()) {
+    JsonVariantConst wanBlock = uptimeStats["WAN"];
+
+    if (wanBlock.isNull()) {
+      // uptime_stats present but WAN key missing → port disabled / physical link down
+      return true;
+    }
+
+    // downtime field appears in uptime_stats.WAN only during an active outage
+    if (!wanBlock["downtime"].isNull()) return true;
+
+    // All alerting monitors failing → ISP unreachable even with carrier present
+    JsonVariantConst alerting = wanBlock["alerting_monitors"];
+    if (!alerting.isNull() && alerting.is<JsonArrayConst>()) {
+      JsonArrayConst arr = alerting.as<JsonArrayConst>();
+      if (arr.size() > 0) {
+        bool allDown = true;
+        for (JsonVariantConst mon : arr) {
+          if ((mon["availability"] | 1) != 0) { allDown = false; break; }
+        }
+        if (allDown) return true;
+      }
+    }
+
+    // WAN block present, no downtime, probes passing → link is up
+    return false;
+  }
+
+  // uptime_stats absent entirely — isp_name present only when link is genuinely up
+  if (!wanObj["isp_name"].isNull()) return false;
+
+  // Fallback boolean flags for other UniFi hardware / firmware variants
   const char* boolDownKeys[] = {"up", "connected", "is_up", "link_up", "wan_up"};
   for (size_t i = 0; i < sizeof(boolDownKeys) / sizeof(boolDownKeys[0]); i++) {
     JsonVariantConst v = wanObj[boolDownKeys[i]];
-    if (v.is<bool>()) {
-      return !v.as<bool>();
-    }
+    if (v.is<bool>()) return !v.as<bool>();
   }
 
-  // Text state keys
+  // Fallback text state keys
   const char* stateKeys[] = {"status", "state", "wan_status", "link_state"};
   for (size_t i = 0; i < sizeof(stateKeys) / sizeof(stateKeys[0]); i++) {
     JsonVariantConst v = wanObj[stateKeys[i]];
@@ -1562,7 +1665,7 @@ void drawTrafficGraphInBox(float* history, int leftX, int rightX, int topY, int 
 }
 
 void drawDisplay() {
-  char bufIn[16], bufOut[16], clientBuf[20], uptimeBuf[12], latencyBuf[12];
+  char bufIn[16], bufOut[16], clientBuf[20], uptimeBuf[12], latencyBuf[12], usageBuf[12];
   char inLine[24], outLine[24];
 
   // Hold the mutex while reading shared globals and filling the u8g2 frame
@@ -1601,7 +1704,12 @@ void drawDisplay() {
   u8g2.setFont(u8g2_font_4x6_tf);
   const char* title = "INTERNET TRAFFIC";
   int titleW = u8g2.getStrWidth(title);
-  u8g2.drawStr((splitX - titleW) / 2, 7, title);
+  int titleX = (splitX - titleW) / 2;
+  u8g2.drawStr(titleX, 7, title);
+  // Asterisk in top-left corner when a firmware update is available
+  if (g_updateAvailable) {
+    u8g2.drawStr(1, 7, "*");
+  }
 
   u8g2.setFont(u8g2_font_5x8_tf);
   snprintf(inLine, sizeof(inLine), "IN: %s", bufIn);
@@ -1623,26 +1731,26 @@ void drawDisplay() {
   } else {
     snprintf(clientBuf, sizeof(clientBuf), "-");
   }
-  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setFont(u8g2_font_5x8_tf);  // smaller than 6x10
   int clientW = u8g2.getStrWidth(clientBuf);
-  u8g2.drawStr(rightCenterX - (clientW / 2), 17, clientBuf);
+  u8g2.drawStr(rightCenterX - (clientW / 2), 15, clientBuf);
 
   u8g2.setFont(u8g2_font_4x6_tf);
   const char* uptimeTitle = "WAN UPTIME";
   int uptimeTitleW = u8g2.getStrWidth(uptimeTitle);
-  u8g2.drawStr(rightCenterX - (uptimeTitleW / 2), 30, uptimeTitle);
+  u8g2.drawStr(rightCenterX - (uptimeTitleW / 2), 23, uptimeTitle);
 
   if (g_wanUptimePct >= 0.0f) {
-    snprintf(uptimeBuf, sizeof(uptimeBuf), "%.1f%%", g_wanUptimePct);
+    snprintf(uptimeBuf, sizeof(uptimeBuf), "%.2f%%", g_wanUptimePct);
   } else {
-    snprintf(uptimeBuf, sizeof(uptimeBuf), "--.-%%");
+    snprintf(uptimeBuf, sizeof(uptimeBuf), "--.--%%");
   }
   int uptimeW = u8g2.getStrWidth(uptimeBuf);
-  u8g2.drawStr(rightCenterX - (uptimeW / 2), 37, uptimeBuf);
+  u8g2.drawStr(rightCenterX - (uptimeW / 2), 29, uptimeBuf);
 
   const char* latencyTitle = "WAN LATENCY";
   int latencyTitleW = u8g2.getStrWidth(latencyTitle);
-  u8g2.drawStr(rightCenterX - (latencyTitleW / 2), 45, latencyTitle);
+  u8g2.drawStr(rightCenterX - (latencyTitleW / 2), 37, latencyTitle);
 
   if (g_wanLatencyMs >= 0.0f) {
     snprintf(latencyBuf, sizeof(latencyBuf), "%.1fms", g_wanLatencyMs);
@@ -1650,19 +1758,30 @@ void drawDisplay() {
     snprintf(latencyBuf, sizeof(latencyBuf), "--.-ms");
   }
   int latencyW = u8g2.getStrWidth(latencyBuf);
-  u8g2.drawStr(rightCenterX - (latencyW / 2), 52, latencyBuf);
+  u8g2.drawStr(rightCenterX - (latencyW / 2), 43, latencyBuf);
 
-  if (g_updateAvailable) {
-    u8g2.setFont(u8g2_font_4x6_tf);
-    const char* updateTxt = "UPDATE";
-    int updateW = u8g2.getStrWidth(updateTxt);
-    u8g2.drawStr(127 - updateW, 63, updateTxt);
+  // Bottom of right column: USAGE
+  u8g2.setFont(u8g2_font_4x6_tf);
+  const char* usageTitle = "USAGE";
+  int usageTitleW = u8g2.getStrWidth(usageTitle);
+  u8g2.drawStr(rightCenterX - (usageTitleW / 2), 51, usageTitle);
+  if (g_monthlyUsageGB >= 0.0f) {
+    if (g_monthlyUsageGB >= 1000.0f)
+      snprintf(usageBuf, sizeof(usageBuf), "%.1fTB", g_monthlyUsageGB / 1024.0f);
+    else
+      snprintf(usageBuf, sizeof(usageBuf), "%.1fGB", g_monthlyUsageGB);
+  } else {
+    snprintf(usageBuf, sizeof(usageBuf), "--GB");
   }
+  int usageW = u8g2.getStrWidth(usageBuf);
+  u8g2.drawStr(rightCenterX - (usageW / 2), 57, usageBuf);
 
   bool showBootIpOverlay = ((long)(g_bootIpOverlayUntilMs - millis()) > 0);
+  bool showWanDownOverlay = (g_wanDownSinceMs != 0);  // volatile read, no mutex needed
+  if (showWanDownOverlay) showBootIpOverlay = false;   // WAN DOWN takes priority
 
   // -- Status (bottom-left, only on error) ----------------------------------
-  if (!showBootIpOverlay && g_statusMsg != "OK") {
+  if (!showBootIpOverlay && !showWanDownOverlay && g_statusMsg != "OK") {
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, g_statusMsg.c_str());
   }
@@ -1686,6 +1805,34 @@ void drawDisplay() {
     u8g2.setFont(u8g2_font_5x8_tf);
     int ipW = u8g2.getStrWidth(g_bootIpOverlayMsg.c_str());
     u8g2.drawStr(boxX + (boxW - ipW) / 2, boxY + 18, g_bootIpOverlayMsg.c_str());
+  }
+
+  if (showWanDownOverlay) {
+    unsigned long downSecs = (millis() - g_wanDownSinceMs) / 1000UL;
+    unsigned long m = downSecs / 60;
+    unsigned long s = downSecs % 60;
+    char countBuf[16];
+    if (m > 0) snprintf(countBuf, sizeof(countBuf), "%lum %02lus", m, s);
+    else       snprintf(countBuf, sizeof(countBuf), "%lus", s);
+
+    const int boxW = 112;
+    const int boxH = 24;
+    const int boxX = (128 - boxW) / 2;
+    const int boxY = (64 - boxH) / 2;
+
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(boxX, boxY, boxW, boxH);
+    u8g2.setDrawColor(1);
+    u8g2.drawFrame(boxX, boxY, boxW, boxH);
+
+    const char* wanTitle = "WAN DOWN";
+    u8g2.setFont(u8g2_font_4x6_tf);
+    int wanTitleW = u8g2.getStrWidth(wanTitle);
+    u8g2.drawStr(boxX + (boxW - wanTitleW) / 2, boxY + 8, wanTitle);
+
+    u8g2.setFont(u8g2_font_5x8_tf);
+    int countW = u8g2.getStrWidth(countBuf);
+    u8g2.drawStr(boxX + (boxW - countW) / 2, boxY + 18, countBuf);
   }
 
   // Release mutex before the I2C transfer so the network task is not blocked

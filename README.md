@@ -1,52 +1,73 @@
-# UniFi Traffic Monitor – ESP32 + SH1106 OLED
+# UniFi Traffic Monitor - ESP32 + SH1106 OLED
 
-Displays **real-time internet traffic** (IN ↓ / OUT ↑) from a **Ubiquiti UCG-MAX** on a 128×64 SH1106 OLED connected to an ESP32 over I²C.
+Displays **real-time internet traffic** (IN / OUT Mbps) from a **Ubiquiti UCG-MAX** on a 128x64 SH1106 OLED connected to an ESP32 over I2C. Also serves a built-in web dashboard with live graphs and full telemetry.
 
 ---
 
 ## Display layout
 
 ```
-┌────────────────────────────────┐
-│ INTERNET TRAFFIC    │ Clients: │
-├─────────────────────┤          │
-│ IN: 12.45 Mbps      │    12    │
-│   /\/\              │WAN UPTIME│
-├─────────────────────┤  99.9%   │
-│ OUT: 3.56 Mbps      │WAN LATENCY│
-│   /\/\              │  14.2ms  │
-│                     │    UPDATE│
-└────────────────────────────────┘
++---------------------------------+
+|* INTERNET TRAFFIC  | Clients:   |
++--------------------+     12     |
+| IN: 12.45 Mbps     | WAN UPTIME |
+|   /\/\             |  99.82%    |
++--------------------+ WAN LATENCY|
+| OUT: 3.56 Mbps     |   14.2ms   |
+|   /\/\             |   USAGE    |
+|                    |  432.5GB   |
++---------------------------------+
 ```
 
-The panel uses a split layout: **left 2/3** for internet traffic and **right 1/3** for clients.
-The vertical divider spans the full panel height, with the client value slightly below `Clients:`.
-`WAN UPTIME` appears below the client count and shows 24h WAN uptime percentage.
-`WAN LATENCY` appears below uptime and shows current WAN latency in milliseconds.
-The graph lines in **IN** and **OUT** are based on actual sampled traffic history.
-IN and OUT graphs scale independently.
-Graph autoscaling prioritizes recent samples so old spikes don't flatten low-traffic detail.
-When an update is detected, `UPDATE` appears in the bottom-right corner.
+Split layout: **left 2/3** for traffic graphs, **right 1/3** for status panel.
 
-Values automatically switch between **bps**, **Kbps**, and **Mbps** depending on the magnitude.
+- `*` appears top-left when a firmware update is available
+- IN / OUT graphs scale independently based on peak traffic in the ring buffer
+- Values switch automatically between **bps**, **Kbps**, and **Mbps**
+- `WAN UPTIME` - rolling availability percentage from UCG-MAX monitoring probes (2 decimal places)
+- `WAN LATENCY` - average latency from UCG-MAX alerting monitors
+- `USAGE` - current month's total WAN bandwidth (IN + OUT) in GB or TB
+
+### WAN DOWN overlay
+
+When internet connectivity is lost, the normal display is replaced by a centered popup:
+
+```
++---------------------------------+
+|                                 |
+|        +--------------+         |
+|        |   WAN DOWN   |         |
+|        |    2m 14s    |         |
+|        +--------------+         |
+|                                 |
++---------------------------------+
+```
+
+The counter increments in real time (50 Hz) until connectivity is restored. Three failure modes are detected:
+
+- **Port disabled in software** - `uptime_stats` becomes empty `{}`
+- **Modem/ISP outage** - `uptime_stats.WAN.downtime` field appears
+- **All alerting monitors failing** - all `alerting_monitors[*].availability == 0`
+
+---
 
 ## Web dashboard
 
-The ESP32 also serves a built-in web dashboard with the same core metrics as the OLED plus additional health info.
+The ESP32 serves a built-in dashboard on port 80.
 
 - Open: `http://<ESP32_IP>/`
 - Live JSON API: `http://<ESP32_IP>/api/stats`
 
 Dashboard includes:
-- IN / OUT traffic values and history graphs
-- Clients count
-- WAN uptime (24h)
+- IN / OUT traffic values and live history graphs
+- Client count
+- WAN uptime percentage
 - WAN latency
-- Update availability
-- ESP32 CPU utilization estimate and **internal** temperature (°F, approximate)
-- UCG-MAX CPU utilization, memory utilization, and temperature (°F, when exposed by UniFi API)
-- Last-update ages for ESP32 stats and UCG-MAX stats
-- Health details (RSSI, IP, fetch errors, status, free heap, uptime)
+- Monthly bandwidth usage (GB)
+- Firmware update availability
+- ESP32 CPU utilization estimate and internal temperature (deg F)
+- UCG-MAX CPU utilization, memory utilization, and temperature (deg F)
+- Health details (RSSI, IP, fetch errors, WAN down flag, free heap, uptime)
 
 ---
 
@@ -55,39 +76,39 @@ Dashboard includes:
 | Component | Notes |
 |-----------|-------|
 | ESP32 (any variant) | Tested on ESP32-WROOM-32 |
-| SH1106 128×64 OLED (I²C) | Address `0x3C` (or `0x3D`) |
+| SH1106 128x64 OLED (I2C) | Address `0x3C` (or `0x3D`) |
 | UCG-MAX | UniFi OS 5.x / Network 10.x |
 
 ### Wiring
 
 ```
 SH1106 OLED          ESP32
-─────────────────────────────
-VCC  ───────────────  3.3 V
-GND  ───────────────  GND
-SDA  ───────────────  GPIO 21  (default; override in config.h)
-SCL  ───────────────  GPIO 22  (default; override in config.h)
+------------------------------
+VCC  ---------------  3.3 V
+GND  ---------------  GND
+SDA  ---------------  GPIO 21  (default; override in config.h)
+SCL  ---------------  GPIO 22  (default; override in config.h)
 ```
 
 ---
 
 ## Software requirements
 
-Install these libraries through **Arduino IDE → Tools → Manage Libraries**:
+Install via **Arduino IDE -> Tools -> Manage Libraries**:
 
 | Library | Author | Purpose |
 |---------|--------|---------|
 | **U8g2** | oliver | SH1106 display driver |
 | **ArduinoJson** | bblanchon | JSON parsing (v6 or v7) |
 
-The `WiFiClientSecure` and `HTTPClient` libraries ship with the **ESP32 Arduino board package** (no separate install needed).
+`WiFiClientSecure` and `HTTPClient` ship with the **ESP32 Arduino board package** - no separate install needed.
 
 ### Board package
 
-1. In Arduino IDE open **File → Preferences** and add to *Additional board manager URLs*:  
+1. In Arduino IDE open **File -> Preferences** and add to *Additional board manager URLs*:
    `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-2. Open **Tools → Board → Boards Manager**, search for `esp32` and install the **esp32 by Espressif Systems** package.
-3. Select **Tools → Board → ESP32 Arduino → ESP32 Dev Module** (or your specific variant).
+2. Open **Tools -> Board -> Boards Manager**, search for `esp32` and install **esp32 by Espressif Systems**.
+3. Select **Tools -> Board -> ESP32 Arduino -> ESP32 Dev Module** (or your specific variant).
 
 ---
 
@@ -106,13 +127,13 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 // HTTPS port
 #define UNIFI_PORT      443
 
-// UniFi OS API key
+// UniFi OS API key  (UniFi OS -> Settings -> API Keys)
 #define UNIFI_API_KEY   "your_api_key"
 
 // Site (usually "default")
 #define UNIFI_SITE      "default"
 
-// I²C pins (ESP32 defaults)
+// I2C pins (ESP32 defaults)
 #define OLED_SDA_PIN    21
 #define OLED_SCL_PIN    22
 
@@ -122,70 +143,75 @@ Edit `UniFi_Traffic_Monitor/config.h` before flashing:
 // Rebuild TLS after this many consecutive fetch failures
 #define MAX_FETCH_ERRORS  3
 
-// Check for UniFi OS / Network updates every 30 minutes
+// Check for firmware updates every 30 minutes
 #define UPDATE_CHECK_INTERVAL_MS  1800000UL
 
 // Status LED (uses LED_BUILTIN by default)
-#define STATUS_LED_ENABLED       1
+#define STATUS_LED_ENABLED  1
 
-
-// Optional web dashboard auth – leave blank for open access
+// Optional web dashboard digest auth - leave blank for open access
 #define WEB_AUTH_USER   ""
 #define WEB_AUTH_PASS   ""
 
-// BOOT button actions (GPIO0 by default)
-#define BOOT_BUTTON_ENABLED       1
+// BOOT button (GPIO0)
+#define BOOT_BUTTON_ENABLED  1
 ```
-
-> **Tip:** Create a dedicated API key for this device in UniFi OS → Settings → API Keys.
 
 ---
 
 ## How it works
 
-### Authentication (API key)
+### Dual-core architecture
 
-Every request includes the header `X-API-KEY: <your key>`. No login step, no session cookies, no CSRF tokens, no expiry to manage.
+- **Core 0 - networkTask**: all HTTPS polling (traffic stats, monthly usage, update check, controller telemetry). Blocking TLS calls here never stall the display.
+- **Core 1 - loop**: OLED rendering, web server, LED state machine, BOOT button. Runs at 50 Hz; only redraws the OLED when new data arrives.
+- Shared state is protected by a FreeRTOS mutex (`g_dataMutex`). The mutex is released before the I2C transfer so the network task is never blocked by display I/O.
 
 ### Traffic data
 
-`GET https://<UCG-MAX>/proxy/network/api/s/<site>/stat/health`  
-Headers: `X-API-KEY: …` and `Accept: application/json`  
-→ Returns per-subsystem health. The `"wan"` entry contains:
-- `rx_bytes-r` — bytes/sec received (download / IN)
-- `tx_bytes-r` — bytes/sec transmitted (upload / OUT)
+`GET https://<UCG-MAX>/proxy/network/api/s/<site>/stat/health`
 
-The `Clients:` panel value is derived from health subsystem counts (`wlan`/`lan` user totals when available).
-`WAN UPTIME` is parsed from WAN health uptime/availability fields when exposed by the UniFi API.
-`WAN LATENCY` is parsed from WAN latency/ping/rtt fields when exposed by the UniFi API.
+The `wan` subsystem entry contains `rx_bytes-r` (bytes/sec IN) and `tx_bytes-r` (bytes/sec OUT).
+Conversion: `Mbps = bytes_per_sec x 8 / 1 000 000`
 
-Conversion: `Mbps = bytes_per_sec × 8 ÷ 1 000 000`
+Client count is derived from `wlan` + `lan` subsystem user counts.
+
+### WAN uptime
+
+Parsed from `uptime_stats.WAN.uptime / uptime_stats.WAN.time_period x 100` - the same calculation the UCG-MAX display uses, expressed to 2 decimal places. Returns `--` when WAN is down (field absent).
+
+### Monthly usage
+
+`POST https://<UCG-MAX>/proxy/network/api/s/<site>/stat/report/monthly.gw`
+Body: `{"attrs":["wan-rx_bytes","wan-tx_bytes"]}`
+
+Returns the current month's gateway traffic totals. Polled every 5 minutes. Displayed in GB (auto-switches to TB above 1000 GB). Shows `--GB` until first fetch completes (~5 min after boot).
 
 ### Update availability
 
-Every `UPDATE_CHECK_INTERVAL_MS` (default 30 minutes), the sketch checks UniFi update status endpoints.
-If an update flag is detected, the display shows `UPDATE` in the bottom-right corner.
+Checked every `UPDATE_CHECK_INTERVAL_MS` (default 30 min). When an update is detected, a `*` appears to the left of "INTERNET TRAFFIC" on the OLED; the web dashboard shows "UPDATE AVAILABLE".
 
-### Status LED behavior
+### Status LED
 
-- Loading / connecting to WiFi: fast blink
-- WAN down (API reachable): super-fast blink
-- Healthy (`fetchTrafficStats()` successful): heartbeat blink every 30 seconds
-- API/connectivity error: solid ON
+| State | Pattern |
+|-------|---------|
+| Connecting / working | Fast blink |
+| WAN down | Super-fast blink |
+| Healthy | Heartbeat pulse every 30 s |
+| API / connectivity error | Solid ON |
 
-Set `STATUS_LED_ENABLED` to `0` in `config.h` to disable all LED behavior.
+Set `STATUS_LED_ENABLED 0` to disable.
 
-### BOOT button behavior
+### BOOT button
 
-- Short press: show local IP in a bordered popup on OLED for ~5 seconds
-
-Set `BOOT_BUTTON_ENABLED` to `0` in `config.h` if you do not want any BOOT button actions.
+Short press -> shows local IP in a popup overlay on the OLED for ~5 seconds.
+Set `BOOT_BUTTON_ENABLED 0` to disable.
 
 ### Security notes
 
-- HTTPS is currently configured with `setInsecure()` (certificate validation disabled) to support self-signed controller certs.
-- Keep this monitor on a trusted LAN/VLAN. Do not expose it directly to the internet.
+- HTTPS uses `setInsecure()` (certificate validation disabled) to support self-signed UCG-MAX certs. Keep the ESP32 on a trusted LAN/VLAN.
 - The API key is stored in plaintext in `config.h`; treat firmware source and flashed devices as sensitive.
+- The web dashboard supports optional HTTP digest auth via `WEB_AUTH_USER` / `WEB_AUTH_PASS`.
 
 ---
 
@@ -193,11 +219,11 @@ Set `BOOT_BUTTON_ENABLED` to `0` in `config.h` if you do not want any BOOT butto
 
 ```bash
 # Open the sketch folder in Arduino IDE, configure config.h, then:
-# Tools → Port → <your COM/tty port>
-# Sketch → Upload
+# Tools -> Port -> <your COM/tty port>
+# Sketch -> Upload
 ```
 
-Monitor output via **Tools → Serial Monitor** at **115200 baud** to watch API responses and parsed values.
+Monitor output via **Tools -> Serial Monitor** at **115200 baud**.
 
 ---
 
@@ -207,20 +233,296 @@ Monitor output via **Tools → Serial Monitor** at **115200 baud** to watch API 
 |---------|-------------|
 | "WiFi failed" on screen | Wrong SSID/password, or ESP32 too far from AP |
 | "Bad API key" on screen | Wrong or missing `UNIFI_API_KEY` in config.h |
-| "No WAN data" | UCG-MAX WAN interface not active or site name is not `default` |
-| Blank display | Check SDA/SCL wiring; verify I²C address (try `0x3D` in U8g2 constructor) |
-| "Conn error" looping | Network issue; sketch rebuilds TLS automatically after 3 failures |
+| "No WAN data" | UCG-MAX WAN not active or site name is not `default` |
+| Blank display | Check SDA/SCL wiring; verify I2C address (try `0x3D`) |
+| "Conn error" looping | Network issue; TLS rebuilds automatically after 3 failures |
+| USAGE shows `--GB` | Monthly fetch not completed yet - appears within 5 minutes of boot |
 
-### Wrong I²C address?
+### Wrong I2C address?
 
-If the display stays blank, change the constructor in the `.ino` to use address `0x3D`:
+Run an I2C scanner sketch to confirm the address, then update the constructor in the `.ino`:
 
 ```cpp
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, U8X8_PIN_NONE, U8X8_PIN_NONE);
-// then call:
 u8g2.setI2CAddress(0x3D * 2);
 ```
-
-Or run an I²C scanner sketch to confirm the address before flashing.
-
-Ubiquiti Internet traffic tracker on ESP32
+`, and this is the output of running that command instead:
+@drksaber ➜ /workspaces/UI-esp32 (main) $  cat > /workspaces/UI-esp32/README.md 
+<< 'READMEEOF'
+F> # UniFi Traffic Monitor - ESP32 + SH1106 OLED
+> 
+> Displays **real-time internet traffic** (IN / OUT Mbps) from a **Ubiquiti UCG-
+MAX** on a 128x64 SH1106 OLED connected to an ESP32 over I2C. Also serves a buil
+t-in web dashboard with live graphs and full telemetry.
+> 
+> ---
+> 
+> ## Display layout
+> 
+> ```
+> +---------------------------------+
+> |* INTERNET TRAFFIC  | Clients:   |
+> +--------------------+     12     |
+> | IN: 12.45 Mbps     | WAN UPTIME |
+> |   /\/\             |  99.82%    |
+> +--------------------+ WAN LATENCY|
+> | OUT: 3.56 Mbps     |   14.2ms   |
+> |   /\/\             |   USAGE    |
+> |                    |  432.5GB   |
+> +---------------------------------+
+OOT button (GPIO0)
+#define BOOT_B> ```
+> 
+N> Split layout: **left 2/3** for traffic graphs, **right 1/3** for status pane.
+> 
+ > - `*` appears top-left when a firmware update is available
+> - IN / OUT graphs scale independently based on peak traffic in the ring buffer
+> - Values switch automatically between **bps**, **Kbps**, and **Mbps**
+> - `WAN UPTIME` - rolling availability percentage from UCG-MAX monitoring probe
+s (2 decimal places)
+> - `WAN LATENCY` - average latency from UCG-MAX alerting monitors
+> - `USAGE` - current month's total WAN bandwidth (IN + OUT) in GB or TB
+> 
+> ### WAN DOWN overlay
+> 
+> When internet connectivity is lost, the normal display is replaced by a center
+ed popup:
+> 
+> ```
+> +---------------------------------+
+> |                                 |
+> |        +--------------+         |
+> |        |   WAN DOWN   |         |
+> |        |    2m 14s    |         |
+> |        +--------------+         |
+> |                                 |
+> +---------------------------------+
+> ```
+> 
+> The counter increments in real time (50 Hz) until connectivity is restored. Th
+ree failure modes are detected:
+> 
+> - **Port disabled in software** - `uptime_stats` becomes empty `{}`
+> - **Modem/ISP outage** - `uptime_stats.WAN.downtime` field appears
+> - **All alerting monitors failing** - all `alerting_monitors[*].availability =
+= 0`
+> 
+y> ---
+> 
+> ## Web dashboard
+> 
+> The ESP32 serves a built-in dashboard on port 80.
+> 
+> - Open: `http://<ESP32_IP>/`
+> - Live JSON API: `http://<ESP32_IP>/api/stats`
+> 
+> Dashboard includes:
+> - IN / OUT traffic values and live history graphs
+> - Client count
+> - WAN uptime percentage
+> - WAN latency
+> - Monthly bandwidth usage (GB)
+> - Firmware update availability
+> - ESP32 CPU utilization estimate and internal temperature (deg F)
+> - UCG-MAX CPU utilization, memory utilization, and temperature (deg F)
+> - Health details (RSSI, IP, fetch errors, WAN down flag, free heap, uptime)
+> 
+> ---
+> 
+> ## Hardware
+> 
+> | Component | Notes |
+> |-----------|-------|
+> | ESP32 (any variant) | Tested on ESP32-WROOM-32 |
+> | SH1106 128x64 OLED (I2C) | Address `0x3C` (or `0x3D`) |
+> | UCG-MAX | UniFi OS 5.x / Network 10.x |
+> 
+s> ### Wiring
+> 
+)> ```
+> SH1106 OLED          ESP32
+> ------------------------------
+> VCC  ---------------  3.3 V
+> GND  ---------------  GND
+> SDA  ---------------  GPIO 21  (default; override in config.h)
+> SCL  ---------------  GPIO 22  (default; override in config.h)
+> ```
+> 
+> ---
+> 
+> ## Software requirements
+> 
+> Install via **Arduino IDE -> Tools -> Manage Libraries**:
+> 
+> | Library | Author | Purpose |
+> |---------|--------|---------|
+> | **U8g2** | oliver | SH1106 display driver |
+> | **ArduinoJson** | bblanchon | JSON parsing (v6 or v7) |
+> 
+> `WiFiClientSecure` and `HTTPClient` ship with the **ESP32 Arduino board packag
+e** - no separate install needed.
+> 
+> ### Board package
+> 
+> 1. In Arduino IDE open **File -> Preferences** and add to *Additional board ma
+nager URLs*:
+>    `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package
+_esp32_index.json`
+> 2. Open **Tools -> Board -> Boards Manager**, search for `esp32` and install *
+*esp32 by Espressif Systems**.
+> 3. Select **Tools -> Board -> ESP32 Arduino -> ESP32 Dev Module** (or your spe
+cific variant).
+> 
+t> ---
+> 
+f> ## Configuration
+> 
+> Edit `UniFi_Traffic_Monitor/config.h` before flashing:
+> 
+> ```cpp
+> // WiFi
+> #define WIFI_SSID       "your_network_name"
+> #define WIFI_PASSWORD   "your_wifi_password"
+> 
+> // UCG-MAX LAN IP or hostname
+> #define UNIFI_HOST      "192.168.1.1"
+> 
+> // HTTPS port
+> #define UNIFI_PORT      443
+> 
+> // UniFi OS API key  (UniFi OS -> Settings -> API Keys)
+> #define UNIFI_API_KEY   "your_api_key"
+> 
+> // Site (usually "default")
+> #define UNIFI_SITE      "default"
+> 
+> // I2C pins (ESP32 defaults)
+> #define OLED_SDA_PIN    21
+> #define OLED_SCL_PIN    22
+> 
+> // Poll interval (1000 ms recommended)
+> #define POLL_INTERVAL_MS  1000
+> 
+> // Rebuild TLS after this many consecutive fetch failures
+> #define MAX_FETCH_ERRORS  3
+> 
+> // Check for firmware updates every 30 minutes
+> #define UPDATE_CHECK_INTERVAL_MS  1800000UL
+> 
+> // Status LED (uses LED_BUILTIN by default)
+> #define STATUS_LED_ENABLED  1
+> 
+> // Optional web dashboard digest auth - leave blank for open access
+> #define WEB_AUTH_USER   ""
+> #define WEB_AUTH_PASS   ""
+> 
+> // BOOT button (GPIO0)
+> #define BOOT_BUTTON_ENABLED  1
+> ```
+> 
+> ---
+> 
+> ## How it works
+> 
+> ### Dual-core architecture
+> 
+> - **Core 0 - networkTask**: all HTTPS polling (traffic stats, monthly usage, u
+pdate check, controller telemetry). Blocking TLS calls here never stall the disp
+lay.
+> - **Core 1 - loop**: OLED rendering, web server, LED state machine, BOOT butto
+n. Runs at 50 Hz; only redraws the OLED when new data arrives.
+> - Shared state is protected by a FreeRTOS mutex (`g_dataMutex`). The mutex is 
+released before the I2C transfer so the network task is never blocked by display
+ I/O.
+> 
+> ### Traffic data
+> 
+> `GET https://<UCG-MAX>/proxy/network/api/s/<site>/stat/health`
+> 
+> The `wan` subsystem entry contains `rx_bytes-r` (bytes/sec IN) and `tx_bytes-r
+` (bytes/sec OUT).
+> Conversion: `Mbps = bytes_per_sec x 8 / 1 000 000`
+> 
+> Client count is derived from `wlan` + `lan` subsystem user counts.
+> 
+> ### WAN uptime
+> 
+> Parsed from `uptime_stats.WAN.uptime / uptime_stats.WAN.time_period x 100` - t
+he same calculation the UCG-MAX display uses, expressed to 2 decimal places. Ret
+urns `--` when WAN is down (field absent).
+> 
+> ### Monthly usage
+> 
+> `POST https://<UCG-MAX>/proxy/network/api/s/<site>/stat/report/monthly.gw`
+> Body: `{"attrs":["wan-rx_bytes","wan-tx_bytes"]}`
+> 
+> Returns the current month's gateway traffic totals. Polled every 5 minutes. Di
+splayed in GB (auto-switches to TB above 1000 GB). Shows `--GB` until first fetc
+h completes (~5 min after boot).
+> 
+> ### Update availability
+> 
+> Checked every `UPDATE_CHECK_INTERVAL_MS` (default 30 min). When an update is d
+etected, a `*` appears to the left of "INTERNET TRAFFIC" on the OLED; the web da
+shboard shows "UPDATE AVAILABLE".
+> 
+> ### Status LED
+> 
+> | State | Pattern |
+> |-------|---------|
+> | Connecting / working | Fast blink |
+> | WAN down | Super-fast blink |
+> | Healthy | Heartbeat pulse every 30 s |
+> | API / connectivity error | Solid ON |
+> 
+> Set `STATUS_LED_ENABLED 0` to disable.
+> 
+> ### BOOT button
+> 
+> Short press -> shows local IP in a popup overlay on the OLED for ~5 seconds.
+> Set `BOOT_BUTTON_ENABLED 0` to disable.
+> 
+> ### Security notes
+> 
+> - HTTPS uses `setInsecure()` (certificate validation disabled) to support self
+-signed UCG-MAX certs. Keep the ESP32 on a trusted LAN/VLAN.
+> - The API key is stored in plaintext in `config.h`; treat firmware source and 
+flashed devices as sensitive.
+> - The web dashboard supports optional HTTP digest auth via `WEB_AUTH_USER` / `
+WEB_AUTH_PASS`.
+> 
+> ---
+> 
+> ## Flashing
+> 
+> ```bash
+> # Open the sketch folder in Arduino IDE, configure config.h, then:
+> # Tools -> Port -> <your COM/tty port>
+> # Sketch -> Upload
+> ```
+> 
+> Monitor output via **Tools -> Serial Monitor** at **115200 baud**.
+> 
+> ---
+> 
+> ## Troubleshooting
+> 
+> | Symptom | Likely cause |
+> |---------|-------------|
+> | "WiFi failed" on screen | Wrong SSID/password, or ESP32 too far from AP |
+> | "Bad API key" on screen | Wrong or missing `UNIFI_API_KEY` in config.h |
+> | "No WAN data" | UCG-MAX WAN not active or site name is not `default` |
+> | Blank display | Check SDA/SCL wiring; verify I2C address (try `0x3D`) |
+> | "Conn error" looping | Network issue; TLS rebuilds automatically after 3 fai
+lures |
+> | USAGE shows `--GB` | Monthly fetch not completed yet - appears within 5 minu
+tes of boot |
+> 
+> ### Wrong I2C address?
+> 
+> Run an I2C scanner sketch to confirm the address, then update the constructor 
+in the `.ino`:
+> 
+> ```cpp
+> u8g2.setI2CAddress(0x3D * 2);
+> ```
+> READMEEOF
