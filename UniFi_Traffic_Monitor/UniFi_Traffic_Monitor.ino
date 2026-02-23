@@ -1237,7 +1237,7 @@ bool extractWanUptime24h(JsonObjectConst wanObj, float& pct) {
       int uptimeSecs    = wanBlock["uptime"]     | -1;
       int timePeriodSecs = wanBlock["time_period"] | -1;
       if (uptimeSecs >= 0 && timePeriodSecs > 0) {
-        pct = 100.0f * (float)uptimeSecs / (float)timePeriodSecs;
+        pct = min(100.0f, 100.0f * (float)uptimeSecs / (float)timePeriodSecs);
         return true;
       }
       // Fallback: integer availability if time fields absent
