@@ -985,7 +985,10 @@ bool fetchTrafficStats() {
 
 bool fetchMonthlyUsage() {
   // POST /proxy/network/api/s/{site}/stat/report/monthly.gw
-  // Returns monthly WAN traffic totals bucketed by month.
+  // The controller returns one bucket per calendar month, sorted oldest-first.
+  // The LAST entry is always the current (incomplete) month - exactly what the
+  // UCG-MAX GUI displays. Reading only that entry means no NTP, no date math,
+  // and the counter resets at the month boundary just as the GUI does.
   if (!g_httpInitialised) initHttpClient();
 
   String url = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT
@@ -1021,12 +1024,10 @@ bool fetchMonthlyUsage() {
   JsonArray dataArr = doc["data"].as<JsonArray>();
   if (dataArr.isNull() || dataArr.size() == 0) return false;
 
-  // Sum all entries (POST without date range returns current month buckets)
-  double rxBytes = 0, txBytes = 0;
-  for (JsonObject entry : dataArr) {
-    rxBytes += entry["wan-rx_bytes"].as<double>();
-    txBytes += entry["wan-tx_bytes"].as<double>();
-  }
+  // Take only the last (most recent) entry - that is the current month.
+  JsonObject last = dataArr[dataArr.size() - 1];
+  double rxBytes = last["wan-rx_bytes"].as<double>();
+  double txBytes = last["wan-tx_bytes"].as<double>();
 
   float totalGB = (float)((rxBytes + txBytes) / 1.0e9);
   Serial.printf("[Monthly] usage=%.2f GB\n", totalGB);
