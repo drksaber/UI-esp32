@@ -155,7 +155,12 @@ bool  fetchUpdateAvailability(bool& updateAvailable);
 bool  fetchJsonPayload(const String& url, String& payload, int& httpCode, int timeoutMs = 8000);
 bool  keyLooksLikeUpdate(const char* key);
 bool  keyLooksLikeAvailability(const char* key);
+bool  keyLooksLikeInstalledVersion(const char* key);
+bool  keyLooksLikeAvailableVersion(const char* key);
 bool  valueLooksAvailable(JsonVariantConst value);
+bool  extractVersionString(JsonVariantConst value, String& version);
+int   compareVersionStrings(const String& lhs, const String& rhs);
+bool  objectIndicatesUpdateAvailable(JsonObjectConst obj, bool allowLooseAvailableKeys);
 bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false, bool allowLooseAvailableKeys = false);
 bool  parsePercentValue(JsonVariantConst value, float& pct);
 bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
@@ -351,7 +356,9 @@ void networkTask(void* pvParameters) {
         bool checkOk = fetchUpdateAvailability(updateAvailable);
         if (checkOk) {
           xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+          bool changed = (g_updateAvailable != updateAvailable);
           g_updateAvailable = updateAvailable;
+          if (changed) g_dataVersion++;
           xSemaphoreGive(g_dataMutex);
           Serial.printf("[Update] available=%s\n", updateAvailable ? "yes" : "no");
         } else {
@@ -1097,6 +1104,32 @@ bool keyLooksLikeAvailability(const char* key) {
          (k.indexOf("status") >= 0);
 }
 
+bool keyLooksLikeInstalledVersion(const char* key) {
+  if (!key) return false;
+  String k = key;
+  k.toLowerCase();
+
+  return (k == "version") ||
+         (k.indexOf("current_version") >= 0) ||
+         (k.indexOf("installed_version") >= 0) ||
+         (k.indexOf("running_version") >= 0) ||
+         (k.indexOf("version_current") >= 0);
+}
+
+bool keyLooksLikeAvailableVersion(const char* key) {
+  if (!key) return false;
+  String k = key;
+  k.toLowerCase();
+
+  return (k.indexOf("available_version") >= 0) ||
+         (k.indexOf("latest_version") >= 0) ||
+         (k.indexOf("target_version") >= 0) ||
+         (k.indexOf("upgrade_to") >= 0) ||
+         (k.indexOf("new_version") >= 0) ||
+         (k == "latest") ||
+         (k == "target");
+}
+
 bool valueLooksAvailable(JsonVariantConst value) {
   if (value.is<bool>()) {
     return value.as<bool>();
@@ -1126,9 +1159,112 @@ bool valueLooksAvailable(JsonVariantConst value) {
   return false;
 }
 
+bool extractVersionString(JsonVariantConst value, String& version) {
+  version = "";
+
+  if (value.is<const char*>()) {
+    String s = value.as<const char*>();
+    s.trim();
+    bool hasDigit = false;
+    for (size_t i = 0; i < s.length(); i++) {
+      if (isDigit(static_cast<unsigned char>(s[i]))) {
+        hasDigit = true;
+        break;
+      }
+    }
+    if (hasDigit) {
+      version = s;
+      return true;
+    }
+    return false;
+  }
+
+  if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
+    double numeric = value.as<double>();
+    if (numeric >= 0.0) {
+      version = String(numeric, 3);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+int compareVersionStrings(const String& lhs, const String& rhs) {
+  size_t i = 0;
+  size_t j = 0;
+
+  while (i < lhs.length() || j < rhs.length()) {
+    while (i < lhs.length() && !isDigit(static_cast<unsigned char>(lhs[i]))) i++;
+    while (j < rhs.length() && !isDigit(static_cast<unsigned char>(rhs[j]))) j++;
+
+    if (i >= lhs.length() && j >= rhs.length()) return 0;
+    if (i >= lhs.length()) return -1;
+    if (j >= rhs.length()) return 1;
+
+    unsigned long leftPart = 0;
+    while (i < lhs.length() && isDigit(static_cast<unsigned char>(lhs[i]))) {
+      leftPart = (leftPart * 10UL) + (lhs[i] - '0');
+      i++;
+    }
+
+    unsigned long rightPart = 0;
+    while (j < rhs.length() && isDigit(static_cast<unsigned char>(rhs[j]))) {
+      rightPart = (rightPart * 10UL) + (rhs[j] - '0');
+      j++;
+    }
+
+    if (leftPart < rightPart) return -1;
+    if (leftPart > rightPart) return 1;
+  }
+
+  return 0;
+}
+
+bool objectIndicatesUpdateAvailable(JsonObjectConst obj, bool allowLooseAvailableKeys) {
+  String installedVersion;
+  String availableVersion;
+
+  for (JsonPairConst kv : obj) {
+    const char* key = kv.key().c_str();
+    JsonVariantConst child = kv.value();
+
+    if (keyLooksLikeInstalledVersion(key)) {
+      String parsed;
+      if (extractVersionString(child, parsed)) {
+        installedVersion = parsed;
+      }
+    }
+
+    if (keyLooksLikeAvailableVersion(key)) {
+      String parsed;
+      if (extractVersionString(child, parsed)) {
+        availableVersion = parsed;
+      }
+    }
+
+    bool thisKeyIsUpdate = keyLooksLikeUpdate(key);
+    bool thisKeyIsAvailability = allowLooseAvailableKeys && keyLooksLikeAvailability(key);
+    if ((thisKeyIsUpdate || thisKeyIsAvailability) && valueLooksAvailable(child)) {
+      return true;
+    }
+  }
+
+  if (availableVersion.length() > 0) {
+    if (installedVersion.length() == 0) return true;
+    return compareVersionStrings(installedVersion, availableVersion) < 0;
+  }
+
+  return false;
+}
+
 bool jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey, bool allowLooseAvailableKeys) {
   if (node.is<JsonObjectConst>()) {
     JsonObjectConst obj = node.as<JsonObjectConst>();
+    if (objectIndicatesUpdateAvailable(obj, allowLooseAvailableKeys)) {
+      return true;
+    }
+
     for (JsonPairConst kv : obj) {
       const char* key = kv.key().c_str();
       JsonVariantConst child = kv.value();
