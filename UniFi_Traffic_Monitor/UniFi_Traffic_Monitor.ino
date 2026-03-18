@@ -154,8 +154,9 @@ bool  fetchTrafficStats();
 bool  fetchUpdateAvailability(bool& updateAvailable);
 bool  fetchJsonPayload(const String& url, String& payload, int& httpCode, int timeoutMs = 8000);
 bool  keyLooksLikeUpdate(const char* key);
+bool  keyLooksLikeAvailability(const char* key);
 bool  valueLooksAvailable(JsonVariantConst value);
-bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false);
+bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false, bool allowLooseAvailableKeys = false);
 bool  parsePercentValue(JsonVariantConst value, float& pct);
 bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
 bool  parseLatencyValue(JsonVariantConst value, float& latencyMs);
@@ -1073,7 +1074,27 @@ bool keyLooksLikeUpdate(const char* key) {
   if (!key) return false;
   String k = key;
   k.toLowerCase();
-  return (k.indexOf("update") >= 0) || (k.indexOf("upgrade") >= 0) || (k.indexOf("upgradable") >= 0);
+  return (k.indexOf("update") >= 0) ||
+         (k.indexOf("upgrade") >= 0) ||
+         (k.indexOf("upgradable") >= 0) ||
+         (k.indexOf("firmware") >= 0) ||
+         (k.indexOf("release") >= 0) ||
+         (k.indexOf("install") >= 0);
+}
+
+bool keyLooksLikeAvailability(const char* key) {
+  if (!key) return false;
+  String k = key;
+  k.toLowerCase();
+
+  return (k == "available") ||
+         (k.indexOf("available_version") >= 0) ||
+         (k.indexOf("latest_version") >= 0) ||
+         (k.indexOf("target_version") >= 0) ||
+         (k.indexOf("candidate") >= 0) ||
+         (k.indexOf("pending") >= 0) ||
+         (k.indexOf("required") >= 0) ||
+         (k.indexOf("status") >= 0);
 }
 
 bool valueLooksAvailable(JsonVariantConst value) {
@@ -1088,25 +1109,39 @@ bool valueLooksAvailable(JsonVariantConst value) {
   if (value.is<const char*>()) {
     String s = value.as<const char*>();
     s.toLowerCase();
-    return (s == "true") || (s == "yes") || (s == "available") || (s == "pending") || (s == "required");
+    return (s == "true") ||
+           (s == "yes") ||
+           (s == "available") ||
+           (s == "pending") ||
+           (s == "required") ||
+           (s == "ready") ||
+           (s == "installable") ||
+           (s == "downloaded");
+  }
+
+  if (value.is<JsonArrayConst>()) {
+    return value.as<JsonArrayConst>().size() > 0;
   }
 
   return false;
 }
 
-bool jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey) {
+bool jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey, bool allowLooseAvailableKeys) {
   if (node.is<JsonObjectConst>()) {
     JsonObjectConst obj = node.as<JsonObjectConst>();
     for (JsonPairConst kv : obj) {
       const char* key = kv.key().c_str();
       JsonVariantConst child = kv.value();
       bool thisKeyIsUpdate = keyLooksLikeUpdate(key);
+      bool thisKeyIsAvailability = allowLooseAvailableKeys && keyLooksLikeAvailability(key);
 
-      if (thisKeyIsUpdate && valueLooksAvailable(child)) {
+      if ((thisKeyIsUpdate || thisKeyIsAvailability) && valueLooksAvailable(child)) {
         return true;
       }
 
-      if (jsonContainsUpdateAvailable(child, parentIsUpdateKey || thisKeyIsUpdate)) {
+      if (jsonContainsUpdateAvailable(child,
+                                      parentIsUpdateKey || thisKeyIsUpdate,
+                                      allowLooseAvailableKeys)) {
         return true;
       }
     }
@@ -1116,7 +1151,7 @@ bool jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey) 
   if (node.is<JsonArrayConst>()) {
     JsonArrayConst arr = node.as<JsonArrayConst>();
     for (JsonVariantConst item : arr) {
-      if (jsonContainsUpdateAvailable(item, parentIsUpdateKey)) {
+      if (jsonContainsUpdateAvailable(item, parentIsUpdateKey, allowLooseAvailableKeys)) {
         return true;
       }
     }
@@ -1135,12 +1170,13 @@ bool fetchUpdateAvailability(bool& updateAvailable) {
 
   String base = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT;
   String endpoint1 = base + "/api/system/updates";
-  String endpoint2 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo";
+  String endpoint2 = base + "/api/system";
+  String endpoint3 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo";
 
-  const String endpoints[2] = {endpoint1, endpoint2};
+  const String endpoints[3] = {endpoint1, endpoint2, endpoint3};
   bool anySuccess = false;
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     String payload;
     int httpCode = 0;
     bool ok = fetchJsonPayload(endpoints[i], payload, httpCode);
@@ -1165,7 +1201,9 @@ bool fetchUpdateAvailability(bool& updateAvailable) {
     }
 
     anySuccess = true;
-    if (jsonContainsUpdateAvailable(doc.as<JsonVariantConst>())) {
+    bool allowLooseAvailableKeys = endpoints[i].endsWith("/api/system/updates") ||
+                                   endpoints[i].endsWith("/api/system");
+    if (jsonContainsUpdateAvailable(doc.as<JsonVariantConst>(), false, allowLooseAvailableKeys)) {
       updateAvailable = true;
       return true;
     }
