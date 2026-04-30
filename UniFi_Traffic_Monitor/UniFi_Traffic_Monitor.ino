@@ -32,11 +32,6 @@
  *   Core 1 (loop)        - OLED display, web server, LED, BOOT button.
  *   Shared state is protected by g_dataMutex (FreeRTOS mutex).
  *
- * Power monitor (optional):
- *   Set POWER_MONITOR_PIN in config.h to an ADC1 pin (GPIO32-39) connected
- *   through a resistor voltage divider to the supply rail.  The firmware
- *   averages 4 ADC samples per poll cycle and reports the result to the web
- *   dashboard as supply_voltage_v.  Set POWER_MONITOR_PIN to -1 to disable.
  */
 
 #include <WiFi.h>
@@ -85,7 +80,6 @@ static float  g_ucgCpuUtilPct  = -1.0f;
 static float  g_ucgMemUtilPct  = -1.0f;
 static float  g_ucgTempC       = -1.0f;
 static float  g_monthlyUsageGB = -1.0f;
-static float  g_supplyVoltageV = -1.0f;
 static unsigned long g_lastEspStatsUpdateMs = 0;
 static unsigned long g_lastUcgStatsUpdateMs = 0;
 
@@ -364,17 +358,9 @@ void networkTask(void* pvParameters) {
       float espTemp = temperatureRead();
       unsigned long pollElapsed = millis() - pollStart;
       float workPct = min(100.0f, (100.0f * (float)pollElapsed) / (float)POLL_INTERVAL_MS);
-#if POWER_MONITOR_PIN >= 0
-      uint32_t adcAccum = 0;
-      for (int _s = 0; _s < 4; _s++) adcAccum += analogReadMilliVolts(POWER_MONITOR_PIN);
-      float supplyV = (adcAccum / 4.0f / 1000.0f) * POWER_MONITOR_RATIO;
-#else
-      float supplyV = -1.0f;
-#endif
       xSemaphoreTake(g_dataMutex, portMAX_DELAY);
       g_espTempC             = espTemp;
       g_espCpuUtilPct        = workPct;
-      g_supplyVoltageV       = supplyV;
       g_lastEspStatsUpdateMs = millis();
       xSemaphoreGive(g_dataMutex);
 
@@ -615,7 +601,6 @@ void handleWebRoot() {
     <div class="card"><div class="k">UCG CPU</div><div id="ucgCpu" class="v">--</div></div>
     <div class="card"><div class="k">UCG Memory</div><div id="ucgMem" class="v">--</div></div>
     <div class="card"><div class="k">UCG Temp (degF)</div><div id="ucgTemp" class="v">--</div></div>
-    <div class="card"><div class="k">ESP Supply Voltage</div><div id="supplyV" class="v">--</div></div>
   </div>
 
   <div class="grid" style="margin-top:12px;">
@@ -706,7 +691,6 @@ void handleWebRoot() {
         document.getElementById('ucgCpu').textContent = fmtPct(d.ucg_cpu_util_pct);
         document.getElementById('ucgMem').textContent = fmtPct(d.ucg_mem_util_pct);
         document.getElementById('ucgTemp').textContent = fmtTemp(d.ucg_temp_f);
-        document.getElementById('supplyV').textContent = (d.supply_voltage_v != null && d.supply_voltage_v >= 0) ? d.supply_voltage_v.toFixed(2) + ' V' : '--';
         drawLine('inChart', d.in_history || [], '#22c55e');
         drawLine('outChart', d.out_history || [], '#38bdf8');
       } catch (e) {
@@ -762,7 +746,6 @@ void handleWebStats() {
   doc["ucg_mem_util_pct"] = g_ucgMemUtilPct;
   doc["ucg_temp_f"]         = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
   doc["monthly_usage_gb"]   = g_monthlyUsageGB;
-  doc["supply_voltage_v"]   = g_supplyVoltageV;
 
   long espAgeMs = (g_lastEspStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastEspStatsUpdateMs);
   long ucgAgeMs = (g_lastUcgStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastUcgStatsUpdateMs);
