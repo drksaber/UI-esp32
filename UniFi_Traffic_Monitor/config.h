@@ -42,9 +42,16 @@
 // Consecutive fetch failures before the TLS connection is rebuilt
 #define MAX_FETCH_ERRORS  3
 
-// How often to check if UniFi OS / Network updates are available
-// 30 minutes = 1,800,000 ms
-#define UPDATE_CHECK_INTERVAL_MS  1800000UL
+// =============================================================
+//  Power Monitor (optional)
+// =============================================================
+// ADC1 pin wired through a voltage divider to your supply rail.
+// Only ADC1 pins (GPIO32-39) are safe alongside WiFi (ADC2 is blocked by WiFi).
+// POWER_MONITOR_RATIO = (R1 + R2) / R2 for a standard resistor divider.
+//   Example: 100kΩ top + 100kΩ bottom -> ratio 2.0, measures up to ~6.6 V.
+// Set POWER_MONITOR_PIN to -1 to disable.
+#define POWER_MONITOR_PIN    35    // -1 to disable; GPIO35 = ADC1_CH7
+#define POWER_MONITOR_RATIO  2.0f  // multiply ADC voltage by this to get actual supply voltage
 
 // =============================================================
 //  Status LED

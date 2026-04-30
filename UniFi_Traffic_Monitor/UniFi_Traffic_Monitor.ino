@@ -31,6 +31,12 @@
  *   Core 0 (networkTask) - all HTTPS polling; never blocks Core 1.
  *   Core 1 (loop)        - OLED display, web server, LED, BOOT button.
  *   Shared state is protected by g_dataMutex (FreeRTOS mutex).
+ *
+ * Power monitor (optional):
+ *   Set POWER_MONITOR_PIN in config.h to an ADC1 pin (GPIO32-39) connected
+ *   through a resistor voltage divider to the supply rail.  The firmware
+ *   averages 4 ADC samples per poll cycle and reports the result to the web
+ *   dashboard as supply_voltage_v.  Set POWER_MONITOR_PIN to -1 to disable.
  */
 
 #include <WiFi.h>
@@ -70,7 +76,6 @@ static int    g_clients        = -1;
 static float  g_wanUptimePct   = -1.0f;
 static float  g_wanLatencyMs   = -1.0f;
 static bool   g_wanDown        = false;
-static bool   g_updateAvailable = false;
 static String g_statusMsg      = "Connecting...";
 static float  g_inGraphScale   = 0.1f;
 static float  g_outGraphScale  = 0.1f;
@@ -80,6 +85,7 @@ static float  g_ucgCpuUtilPct  = -1.0f;
 static float  g_ucgMemUtilPct  = -1.0f;
 static float  g_ucgTempC       = -1.0f;
 static float  g_monthlyUsageGB = -1.0f;
+static float  g_supplyVoltageV = -1.0f;
 static unsigned long g_lastEspStatsUpdateMs = 0;
 static unsigned long g_lastUcgStatsUpdateMs = 0;
 
@@ -151,17 +157,7 @@ bool  wifiConnect();
 void  initHttpClient();
 void  closeConnection();
 bool  fetchTrafficStats();
-bool  fetchUpdateAvailability(bool& updateAvailable);
 bool  fetchJsonPayload(const String& url, String& payload, int& httpCode, int timeoutMs = 8000);
-bool  keyLooksLikeUpdate(const char* key);
-bool  keyLooksLikeAvailability(const char* key);
-bool  keyLooksLikeInstalledVersion(const char* key);
-bool  keyLooksLikeAvailableVersion(const char* key);
-bool  valueLooksAvailable(JsonVariantConst value);
-bool  extractVersionString(JsonVariantConst value, String& version);
-int   compareVersionStrings(const String& lhs, const String& rhs);
-bool  objectIndicatesUpdateAvailable(JsonObjectConst obj, bool allowLooseAvailableKeys);
-bool  jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey = false, bool allowLooseAvailableKeys = false);
 bool  parsePercentValue(JsonVariantConst value, float& pct);
 bool  extractWanUptime24h(JsonObjectConst wanObj, float& pct);
 bool  parseLatencyValue(JsonVariantConst value, float& latencyMs);
@@ -192,10 +188,6 @@ void  networkTask(void* pvParameters);
 // setup()
 // ===========================================================================
 void setup() {
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("\n[UniFi Traffic Monitor] starting...");
-
   initBootButton();
 
   if (STATUS_LED_ENABLED) {
@@ -235,8 +227,6 @@ void setup() {
     NULL,           // task handle (not needed)
     0               // Core 0
   );
-  Serial.println("[setup] network task started on Core 0");
-  Serial.println("[setup] ready.");
 }
 
 // ===========================================================================
@@ -295,7 +285,6 @@ void networkTask(void* pvParameters) {
 
   // Task-local timing (not shared - no mutex needed).
   unsigned long lastPoll                = 0;
-  unsigned long lastUpdateCheck         = 0;
   unsigned long lastControllerStatsPoll = 0;
   unsigned long lastMonthlyPoll         = 0;
 
@@ -350,23 +339,6 @@ void networkTask(void* pvParameters) {
         xSemaphoreGive(g_dataMutex);
       }
 
-      // ---- Firmware update check (piggybacked on the poll cycle) --------
-      if (lastUpdateCheck == 0 || (millis() - lastUpdateCheck >= UPDATE_CHECK_INTERVAL_MS)) {
-        bool updateAvailable = false;
-        bool checkOk = fetchUpdateAvailability(updateAvailable);
-        if (checkOk) {
-          xSemaphoreTake(g_dataMutex, portMAX_DELAY);
-          bool changed = (g_updateAvailable != updateAvailable);
-          g_updateAvailable = updateAvailable;
-          if (changed) g_dataVersion++;
-          xSemaphoreGive(g_dataMutex);
-          Serial.printf("[Update] available=%s\n", updateAvailable ? "yes" : "no");
-        } else {
-          Serial.println("[Update] check failed; keeping previous state");
-        }
-        lastUpdateCheck = millis();
-      }
-
       // ---- Controller resource stats (every kControllerStatsPollMs) -----
       if (lastControllerStatsPoll == 0 || (millis() - lastControllerStatsPoll >= kControllerStatsPollMs)) {
         float cpuPct = -1.0f, memPct = -1.0f, tempC = -1.0f;
@@ -392,9 +364,17 @@ void networkTask(void* pvParameters) {
       float espTemp = temperatureRead();
       unsigned long pollElapsed = millis() - pollStart;
       float workPct = min(100.0f, (100.0f * (float)pollElapsed) / (float)POLL_INTERVAL_MS);
+#if POWER_MONITOR_PIN >= 0
+      uint32_t adcAccum = 0;
+      for (int _s = 0; _s < 4; _s++) adcAccum += analogReadMilliVolts(POWER_MONITOR_PIN);
+      float supplyV = (adcAccum / 4.0f / 1000.0f) * POWER_MONITOR_RATIO;
+#else
+      float supplyV = -1.0f;
+#endif
       xSemaphoreTake(g_dataMutex, portMAX_DELAY);
       g_espTempC             = espTemp;
       g_espCpuUtilPct        = workPct;
+      g_supplyVoltageV       = supplyV;
       g_lastEspStatsUpdateMs = millis();
       xSemaphoreGive(g_dataMutex);
 
@@ -417,7 +397,6 @@ void initHttpClient() {
   g_secureClient.setInsecure();   // LAN-trust: accept self-signed UCG-MAX cert
   g_http.setReuse(true);          // keep TCP/TLS connection alive between requests
   g_httpInitialised = true;
-  Serial.println("[HTTP] persistent client ready");
 }
 
 /*
@@ -428,7 +407,6 @@ void closeConnection() {
   g_http.end();
   g_secureClient.stop();
   g_httpInitialised = false;
-  Serial.println("[HTTP] connection closed");
 }
 
 // ===========================================================================
@@ -519,7 +497,6 @@ void ledUpdate() {
 bool wifiConnect() {
   ledSetMode(LED_MODE_WORKING);
 
-  Serial.printf("[WiFi] connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -527,15 +504,12 @@ bool wifiConnect() {
   while (WiFi.status() != WL_CONNECTED) {
     ledUpdate();
     if (millis() - t0 > 20000) {
-      Serial.println("[WiFi] timeout");
       ledSetMode(LED_MODE_ERROR);
       return false;
     }
     delay(100);
-    Serial.print('.');
   }
 
-  Serial.printf("\n[WiFi] connected - IP: %s\n", WiFi.localIP().toString().c_str());
   return true;
 }
 
@@ -543,7 +517,6 @@ void initWebServer() {
   g_web.on("/", HTTP_GET, handleWebRoot);
   g_web.on("/api/stats", HTTP_GET, handleWebStats);
   g_web.begin();
-  Serial.printf("[Web] dashboard: http://%s/\n", WiFi.localIP().toString().c_str());
 }
 
 void initBootButton() {
@@ -587,7 +560,6 @@ void updateBootButton() {
 
     g_bootIpOverlayMsg = "IP: " + WiFi.localIP().toString();
     g_bootIpOverlayUntilMs = now + kBootButtonIpShowMs;
-    Serial.printf("[BOOT] short press -> show IP: %s\n", g_bootIpOverlayMsg.c_str());
     // loop() will pick up overlayActive on the very next 20ms tick and redraw.
     return;
   }
@@ -640,10 +612,10 @@ void handleWebRoot() {
     <div class="card"><div class="k">WAN Uptime (24h)</div><div id="uptime" class="v">--</div></div>
     <div class="card"><div class="k">WAN Latency</div><div id="latency" class="v">--</div></div>
     <div class="card"><div class="k">Monthly Usage</div><div id="usage" class="v">--</div></div>
-    <div class="card"><div class="k">Controller Update</div><div id="update" class="v">--</div></div>
     <div class="card"><div class="k">UCG CPU</div><div id="ucgCpu" class="v">--</div></div>
     <div class="card"><div class="k">UCG Memory</div><div id="ucgMem" class="v">--</div></div>
     <div class="card"><div class="k">UCG Temp (degF)</div><div id="ucgTemp" class="v">--</div></div>
+    <div class="card"><div class="k">ESP Supply Voltage</div><div id="supplyV" class="v">--</div></div>
   </div>
 
   <div class="grid" style="margin-top:12px;">
@@ -719,7 +691,6 @@ void handleWebRoot() {
         document.getElementById('clients').textContent = d.clients >= 0 ? d.clients : '--';
         document.getElementById('uptime').textContent = d.wan_uptime_pct >= 0 ? d.wan_uptime_pct.toFixed(2)+'%' : '--.--% ';
         document.getElementById('latency').textContent = d.wan_latency_ms >= 0 ? d.wan_latency_ms.toFixed(1)+' ms' : '--.- ms';
-        document.getElementById('update').textContent = d.update_available ? 'UPDATE AVAILABLE' : 'Up to date';
         document.getElementById('usage').textContent = d.monthly_usage_gb >= 0 ? d.monthly_usage_gb.toFixed(1)+' GB' : '--';
         document.getElementById('rssi').textContent = d.wifi_rssi + ' dBm';
         document.getElementById('ip').textContent = d.ip;
@@ -735,6 +706,7 @@ void handleWebRoot() {
         document.getElementById('ucgCpu').textContent = fmtPct(d.ucg_cpu_util_pct);
         document.getElementById('ucgMem').textContent = fmtPct(d.ucg_mem_util_pct);
         document.getElementById('ucgTemp').textContent = fmtTemp(d.ucg_temp_f);
+        document.getElementById('supplyV').textContent = (d.supply_voltage_v != null && d.supply_voltage_v >= 0) ? d.supply_voltage_v.toFixed(2) + ' V' : '--';
         drawLine('inChart', d.in_history || [], '#22c55e');
         drawLine('outChart', d.out_history || [], '#38bdf8');
       } catch (e) {
@@ -778,7 +750,6 @@ void handleWebStats() {
   doc["wan_uptime_pct"]   = g_wanUptimePct;
   doc["wan_latency_ms"]   = g_wanLatencyMs;
   doc["wan_down"]         = g_wanDown;
-  doc["update_available"] = g_updateAvailable;
   doc["status"]           = g_statusMsg;
   doc["fetch_errors"]     = g_fetchErrors;
   doc["wifi_rssi"]        = WiFi.RSSI();
@@ -791,6 +762,7 @@ void handleWebStats() {
   doc["ucg_mem_util_pct"] = g_ucgMemUtilPct;
   doc["ucg_temp_f"]         = (g_ucgTempC < 0.0f) ? -1.0f : cToF(g_ucgTempC);
   doc["monthly_usage_gb"]   = g_monthlyUsageGB;
+  doc["supply_voltage_v"]   = g_supplyVoltageV;
 
   long espAgeMs = (g_lastEspStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastEspStatsUpdateMs);
   long ucgAgeMs = (g_lastUcgStatsUpdateMs == 0) ? -1L : (long)(millis() - g_lastUcgStatsUpdateMs);
@@ -840,7 +812,6 @@ bool fetchTrafficStats() {
 
   // begin() on the same host reuses the live TLS socket (no new handshake)
   if (!g_http.begin(g_secureClient, url)) {
-    Serial.println("[UniFi] http.begin failed - reconnecting");
     closeConnection();
     initHttpClient();
     _setStatus("Conn error");
@@ -852,16 +823,13 @@ bool fetchTrafficStats() {
   g_http.setTimeout(8000);
 
   int httpCode = g_http.GET();
-  Serial.printf("[UniFi] health HTTP %d\n", httpCode);
 
   if (httpCode == 401 || httpCode == 403) {
-    Serial.println("[UniFi] API key rejected - check UNIFI_API_KEY in config.h");
     _setStatus("Bad API key");
     return false;
   }
 
   if (httpCode <= 0) {
-    Serial.printf("[UniFi] connection error %d, rebuilding TLS\n", httpCode);
     closeConnection();
     initHttpClient();
     _setStatus("Conn error");
@@ -881,14 +849,12 @@ bool fetchTrafficStats() {
   DynamicJsonDocument doc(8192);
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    Serial.printf("[JSON] parse error: %s\n", err.c_str());
     _setStatus("JSON error");
     return false;
   }
 
   JsonArray dataArr = doc["data"].as<JsonArray>();
   if (dataArr.isNull()) {
-    Serial.println("[JSON] 'data' array missing");
     _setStatus("No data");
     return false;
   }
@@ -946,13 +912,11 @@ bool fetchTrafficStats() {
       localInMbps  = rxRate * 8.0f / 1000000.0f;
       localOutMbps = txRate * 8.0f / 1000000.0f;
 
-      Serial.printf("[Stats] IN=%.2f Mbps  OUT=%.2f Mbps\n", localInMbps, localOutMbps);
       foundWan = true;
     }
   }
 
   if (!foundWan) {
-    Serial.println("[Stats] WAN subsystem not found");
     _setStatus("No WAN data");
     return false;
   }
@@ -1016,7 +980,6 @@ bool fetchMonthlyUsage() {
   const char* body = "{\"attrs\":[\"wan-rx_bytes\",\"wan-tx_bytes\"]}";
   int httpCode = g_http.POST(body);
   if (httpCode != 200) {
-    Serial.printf("[Monthly] HTTP %d\n", httpCode);
     return false;
   }
 
@@ -1025,7 +988,6 @@ bool fetchMonthlyUsage() {
   DynamicJsonDocument doc(32768);
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    Serial.printf("[Monthly] JSON error: %s\n", err.c_str());
     return false;
   }
 
@@ -1038,7 +1000,6 @@ bool fetchMonthlyUsage() {
   double txBytes = last["wan-tx_bytes"].as<double>();
 
   float totalGB = (float)((rxBytes + txBytes) / 1.0e9);
-  Serial.printf("[Monthly] usage=%.2f GB\n", totalGB);
 
   xSemaphoreTake(g_dataMutex, portMAX_DELAY);
   g_monthlyUsageGB = totalGB;
@@ -1051,7 +1012,6 @@ bool fetchJsonPayload(const String& url, String& payload, int& httpCode, int tim
   if (!g_httpInitialised) initHttpClient();
 
   if (!g_http.begin(g_secureClient, url)) {
-    Serial.println("[UniFi] http.begin failed during update check");
     closeConnection();
     initHttpClient();
     httpCode = -1;
@@ -1069,7 +1029,6 @@ bool fetchJsonPayload(const String& url, String& payload, int& httpCode, int tim
   }
 
   if (httpCode <= 0) {
-    Serial.printf("[Update] connection error %d; rebuilding TLS\n", httpCode);
     closeConnection();
     initHttpClient();
   }
@@ -1077,276 +1036,6 @@ bool fetchJsonPayload(const String& url, String& payload, int& httpCode, int tim
   return false;
 }
 
-bool keyLooksLikeUpdate(const char* key) {
-  if (!key) return false;
-  String k = key;
-  k.toLowerCase();
-  return (k.indexOf("update") >= 0) ||
-         (k.indexOf("upgrade") >= 0) ||
-         (k.indexOf("upgradable") >= 0) ||
-         (k.indexOf("firmware") >= 0) ||
-         (k.indexOf("release") >= 0) ||
-         (k.indexOf("install") >= 0);
-}
-
-bool keyLooksLikeAvailability(const char* key) {
-  if (!key) return false;
-  String k = key;
-  k.toLowerCase();
-
-  return (k == "available") ||
-         (k.indexOf("available_version") >= 0) ||
-         (k.indexOf("latest_version") >= 0) ||
-         (k.indexOf("target_version") >= 0) ||
-         (k.indexOf("candidate") >= 0) ||
-         (k.indexOf("pending") >= 0) ||
-         (k.indexOf("required") >= 0) ||
-         (k.indexOf("status") >= 0);
-}
-
-bool keyLooksLikeInstalledVersion(const char* key) {
-  if (!key) return false;
-  String k = key;
-  k.toLowerCase();
-
-  return (k == "version") ||
-         (k.indexOf("current_version") >= 0) ||
-         (k.indexOf("installed_version") >= 0) ||
-         (k.indexOf("running_version") >= 0) ||
-         (k.indexOf("version_current") >= 0);
-}
-
-bool keyLooksLikeAvailableVersion(const char* key) {
-  if (!key) return false;
-  String k = key;
-  k.toLowerCase();
-
-  return (k.indexOf("available_version") >= 0) ||
-         (k.indexOf("latest_version") >= 0) ||
-         (k.indexOf("target_version") >= 0) ||
-         (k.indexOf("upgrade_to") >= 0) ||
-         (k.indexOf("new_version") >= 0) ||
-         (k == "latest") ||
-         (k == "target");
-}
-
-bool valueLooksAvailable(JsonVariantConst value) {
-  if (value.is<bool>()) {
-    return value.as<bool>();
-  }
-
-  if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
-    return value.as<double>() > 0.0;
-  }
-
-  if (value.is<const char*>()) {
-    String s = value.as<const char*>();
-    s.toLowerCase();
-    return (s == "true") ||
-           (s == "yes") ||
-           (s == "available") ||
-           (s == "pending") ||
-           (s == "required") ||
-           (s == "ready") ||
-           (s == "installable") ||
-           (s == "downloaded");
-  }
-
-  if (value.is<JsonArrayConst>()) {
-    return value.as<JsonArrayConst>().size() > 0;
-  }
-
-  return false;
-}
-
-bool extractVersionString(JsonVariantConst value, String& version) {
-  version = "";
-
-  if (value.is<const char*>()) {
-    String s = value.as<const char*>();
-    s.trim();
-    bool hasDigit = false;
-    for (size_t i = 0; i < s.length(); i++) {
-      if (isDigit(static_cast<unsigned char>(s[i]))) {
-        hasDigit = true;
-        break;
-      }
-    }
-    if (hasDigit) {
-      version = s;
-      return true;
-    }
-    return false;
-  }
-
-  if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
-    double numeric = value.as<double>();
-    if (numeric >= 0.0) {
-      version = String(numeric, 3);
-      return true;
-    }
-  }
-
-  return false;
-}
-
-int compareVersionStrings(const String& lhs, const String& rhs) {
-  size_t i = 0;
-  size_t j = 0;
-
-  while (i < lhs.length() || j < rhs.length()) {
-    while (i < lhs.length() && !isDigit(static_cast<unsigned char>(lhs[i]))) i++;
-    while (j < rhs.length() && !isDigit(static_cast<unsigned char>(rhs[j]))) j++;
-
-    if (i >= lhs.length() && j >= rhs.length()) return 0;
-    if (i >= lhs.length()) return -1;
-    if (j >= rhs.length()) return 1;
-
-    unsigned long leftPart = 0;
-    while (i < lhs.length() && isDigit(static_cast<unsigned char>(lhs[i]))) {
-      leftPart = (leftPart * 10UL) + (lhs[i] - '0');
-      i++;
-    }
-
-    unsigned long rightPart = 0;
-    while (j < rhs.length() && isDigit(static_cast<unsigned char>(rhs[j]))) {
-      rightPart = (rightPart * 10UL) + (rhs[j] - '0');
-      j++;
-    }
-
-    if (leftPart < rightPart) return -1;
-    if (leftPart > rightPart) return 1;
-  }
-
-  return 0;
-}
-
-bool objectIndicatesUpdateAvailable(JsonObjectConst obj, bool allowLooseAvailableKeys) {
-  String installedVersion;
-  String availableVersion;
-
-  for (JsonPairConst kv : obj) {
-    const char* key = kv.key().c_str();
-    JsonVariantConst child = kv.value();
-
-    if (keyLooksLikeInstalledVersion(key)) {
-      String parsed;
-      if (extractVersionString(child, parsed)) {
-        installedVersion = parsed;
-      }
-    }
-
-    if (keyLooksLikeAvailableVersion(key)) {
-      String parsed;
-      if (extractVersionString(child, parsed)) {
-        availableVersion = parsed;
-      }
-    }
-
-    bool thisKeyIsUpdate = keyLooksLikeUpdate(key);
-    bool thisKeyIsAvailability = allowLooseAvailableKeys && keyLooksLikeAvailability(key);
-    if ((thisKeyIsUpdate || thisKeyIsAvailability) && valueLooksAvailable(child)) {
-      return true;
-    }
-  }
-
-  if (availableVersion.length() > 0) {
-    if (installedVersion.length() == 0) return true;
-    return compareVersionStrings(installedVersion, availableVersion) < 0;
-  }
-
-  return false;
-}
-
-bool jsonContainsUpdateAvailable(JsonVariantConst node, bool parentIsUpdateKey, bool allowLooseAvailableKeys) {
-  if (node.is<JsonObjectConst>()) {
-    JsonObjectConst obj = node.as<JsonObjectConst>();
-    if (objectIndicatesUpdateAvailable(obj, allowLooseAvailableKeys)) {
-      return true;
-    }
-
-    for (JsonPairConst kv : obj) {
-      const char* key = kv.key().c_str();
-      JsonVariantConst child = kv.value();
-      bool thisKeyIsUpdate = keyLooksLikeUpdate(key);
-      bool thisKeyIsAvailability = allowLooseAvailableKeys && keyLooksLikeAvailability(key);
-
-      if ((thisKeyIsUpdate || thisKeyIsAvailability) && valueLooksAvailable(child)) {
-        return true;
-      }
-
-      if (jsonContainsUpdateAvailable(child,
-                                      parentIsUpdateKey || thisKeyIsUpdate,
-                                      allowLooseAvailableKeys)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  if (node.is<JsonArrayConst>()) {
-    JsonArrayConst arr = node.as<JsonArrayConst>();
-    for (JsonVariantConst item : arr) {
-      if (jsonContainsUpdateAvailable(item, parentIsUpdateKey, allowLooseAvailableKeys)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  if (parentIsUpdateKey) {
-    return valueLooksAvailable(node);
-  }
-
-  return false;
-}
-
-bool fetchUpdateAvailability(bool& updateAvailable) {
-  updateAvailable = false;
-
-  String base = String("https://") + UNIFI_HOST + ":" + UNIFI_PORT;
-  String endpoint1 = base + "/api/system/updates";
-  String endpoint2 = base + "/api/system";
-  String endpoint3 = base + "/proxy/network/api/s/" + UNIFI_SITE + "/stat/sysinfo";
-
-  const String endpoints[3] = {endpoint1, endpoint2, endpoint3};
-  bool anySuccess = false;
-
-  for (int i = 0; i < 3; i++) {
-    String payload;
-    int httpCode = 0;
-    bool ok = fetchJsonPayload(endpoints[i], payload, httpCode);
-
-    if (httpCode == 401 || httpCode == 403) {
-      Serial.println("[Update] API key rejected during update check");
-      continue;
-    }
-
-    if (!ok) {
-      if (httpCode > 0) {
-        Serial.printf("[Update] endpoint %d returned HTTP %d\n", i + 1, httpCode);
-      }
-      continue;
-    }
-
-    DynamicJsonDocument doc(24576);
-    DeserializationError err = deserializeJson(doc, payload);
-    if (err) {
-      Serial.printf("[Update] JSON parse error on endpoint %d: %s\n", i + 1, err.c_str());
-      continue;
-    }
-
-    anySuccess = true;
-    bool allowLooseAvailableKeys = endpoints[i].endsWith("/api/system/updates") ||
-                                   endpoints[i].endsWith("/api/system");
-    if (jsonContainsUpdateAvailable(doc.as<JsonVariantConst>(), false, allowLooseAvailableKeys)) {
-      updateAvailable = true;
-      return true;
-    }
-  }
-
-  return anySuccess;
-}
 
 bool parsePercentValue(JsonVariantConst value, float& pct) {
   if (value.isNull()) return false;
@@ -1881,11 +1570,6 @@ void drawDisplay() {
   int titleW = u8g2.getStrWidth(title);
   int titleX = (splitX - titleW) / 2;
   u8g2.drawStr(titleX, 7, title);
-  // Asterisk in top-left corner when a firmware update is available
-  if (g_updateAvailable) {
-    u8g2.drawStr(1, 7, "*");
-  }
-
   u8g2.setFont(u8g2_font_5x8_tf);
   snprintf(inLine, sizeof(inLine), "IN: %s", bufIn);
   u8g2.drawStr(4, 20, inLine);
